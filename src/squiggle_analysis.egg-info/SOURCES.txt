@@ -1,7 +1,14 @@
 pyproject.toml
 src/squiggle_analysis/__init__.py
+src/squiggle_analysis/__main__.py
+src/squiggle_analysis/cli.py
+src/squiggle_analysis/run.py
 src/squiggle_analysis.egg-info/PKG-INFO
 src/squiggle_analysis.egg-info/SOURCES.txt
 src/squiggle_analysis.egg-info/dependency_links.txt
 src/squiggle_analysis.egg-info/requires.txt
 src/squiggle_analysis.egg-info/top_level.txt
+src/squiggle_analysis/events/change_point.py
+src/squiggle_analysis/geometry/compute_state.py
+src/squiggle_analysis/reporting/report_md.py
+tests/test_smoke.py
