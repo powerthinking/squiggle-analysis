@@ -1,6 +1,7 @@
 import pandas as pd
 from squiggle_core import paths
-from squiggle_core.geometry.state import compute_effective_rank
+from squiggle_core.geometry.state import compute_effective_rank, compute_topk_mass
+
 
 
 def compute_geometry_state(run_id: str) -> None:
@@ -35,6 +36,7 @@ def compute_geometry_state(run_id: str) -> None:
         for tensor_path in tensor_files:
             layer = parse_layer(tensor_path.name)
             rank = compute_effective_rank(tensor_path)
+            topk = compute_topk_mass(tensor_path, k=8)
 
             rows.append(
                 {
@@ -43,6 +45,15 @@ def compute_geometry_state(run_id: str) -> None:
                     "layer": layer,
                     "metric": "effective_rank",
                     "value": rank,
+                }
+            )
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "step": step,
+                    "layer": layer,
+                    "metric": "topk_mass_k8",
+                    "value": topk,
                 }
             )
 

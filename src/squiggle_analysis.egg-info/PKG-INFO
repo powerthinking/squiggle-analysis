@@ -10,6 +10,7 @@ Requires-Dist: pandas>=2.2
 Requires-Dist: pyarrow>=15.0
 Requires-Dist: matplotlib>=3.8
 Requires-Dist: tqdm>=4.66
+Requires-Dist: tabulate>=0.9
 Requires-Dist: squiggle-core>=0.1.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"

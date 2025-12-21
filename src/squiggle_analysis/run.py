@@ -23,7 +23,7 @@ def run_analysis(run_id: str, force: bool = False):
 
     # 2. Events
     if force or not events_path.exists():
-        detect_events(run_id)
+        detect_events(run_id, rank_threshold=0.2, mass_threshold=0.03)
 
     # 3. Report
     write_report(run_id)

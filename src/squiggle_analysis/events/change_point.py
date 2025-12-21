@@ -2,7 +2,7 @@ import pandas as pd
 from squiggle_core import paths
 
 
-def detect_events(run_id: str, threshold: float = 0.2) -> None:
+def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: float = 0.03) -> None:
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
         raise FileNotFoundError(
@@ -41,23 +41,34 @@ def detect_events(run_id: str, threshold: float = 0.2) -> None:
     events = []
     event_id = 0
 
-    # You can optionally filter to one metric for thin slice
-    geom = geom[geom["metric"] == "effective_rank"].copy()
+    # OPTIONAL: keep all metrics now that we have per-metric thresholds
+    # (Remove the effective_rank filter so topk_mass_k8 can produce events)
+    # geom = geom[geom["metric"] == "effective_rank"].copy()
 
-    for layer, g in geom.groupby("layer"):
+    def _threshold_for_metric(metric_name: str) -> float:
+        if metric_name == "effective_rank":
+            return float(rank_threshold)
+        if metric_name.startswith("topk_mass_"):
+            return float(mass_threshold)
+        # default fallback for future metrics
+        return float(rank_threshold)
+
+    for (layer, metric), g in geom.groupby(["layer", "metric"]):
         g = g.sort_values("step")
         values = g["value"].to_numpy()
         steps = g["step"].to_numpy()
 
+        thr = _threshold_for_metric(str(metric))
+
         for i in range(1, len(values)):
             delta = float(values[i] - values[i - 1])
-            if abs(delta) > threshold:
+            if abs(delta) > thr:
                 events.append(
                     {
                         "run_id": run_id,
                         "event_id": f"e{event_id}",
                         "layer": int(layer),
-                        "metric": "effective_rank",
+                        "metric": str(metric),
                         "start_step": int(steps[i - 1]),
                         "end_step": int(steps[i]),
                         "score": abs(delta),

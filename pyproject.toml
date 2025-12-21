@@ -16,8 +16,10 @@ dependencies = [
   "pyarrow>=15.0",
   "matplotlib>=3.8",
   "tqdm>=4.66",
+  "tabulate>=0.9",
   "squiggle-core>=0.1.0",
 ]
+
 
 [project.optional-dependencies]
 dev = [
