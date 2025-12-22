@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 src/squiggle_analysis/__init__.py
 src/squiggle_analysis/__main__.py

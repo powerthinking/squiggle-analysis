@@ -125,7 +125,6 @@ def write_report(
     scalars_wide = _try_read_parquet(scalars_wide_path)
     scalars_long = _try_read_parquet(scalars_long_path)
 
-    # Prefer wide-form scalars for human summaries; if only long-form exists, pivot it to wide.
     scalars = None
     if scalars_wide is not None and not scalars_wide.empty:
         scalars = scalars_wide
