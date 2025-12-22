@@ -114,14 +114,41 @@ def write_report(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     meta_path = run_dir / "meta.json"
-    scalars_path = paths.metrics_scalar_path(run_id)
-    samples_dir = paths.samples_dir(run_id)
+    scalars_long_path = paths.metrics_scalar_path(run_id)
+    scalars_wide_path = paths.metrics_wide_path(run_id)
+    captures_dir = paths.captures_dir(run_id)
 
-    geometry_path = paths.geometry_state_path(run_id)
+    geometry_path = paths.geometry_state_long_path(run_id)
     events_path = paths.events_path(run_id)
 
     meta = _read_json(meta_path)
-    scalars = _try_read_parquet(scalars_path)
+    scalars_wide = _try_read_parquet(scalars_wide_path)
+    scalars_long = _try_read_parquet(scalars_long_path)
+
+    # Prefer wide-form scalars for human summaries; if only long-form exists, pivot it to wide.
+    scalars = None
+    if scalars_wide is not None and not scalars_wide.empty:
+        scalars = scalars_wide
+    elif scalars_long is not None and not scalars_long.empty:
+        try:
+            tmp = scalars_long.copy()
+            if "wall_time" in tmp.columns:
+                tmp = tmp.drop(columns=["wall_time"])
+            wide = (
+                tmp.pivot_table(
+                    index=["run_id", "step"],
+                    columns="metric_name",
+                    values="value",
+                    aggfunc="last",
+                )
+                .reset_index()
+            )
+            wide.columns = [str(c) for c in wide.columns]
+            if "step" in wide.columns:
+                wide = wide.sort_values("step").reset_index(drop=True)
+            scalars = wide
+        except Exception:
+            scalars = scalars_long
 
     if geom is None:
         geom = _try_read_parquet(geometry_path)
@@ -151,7 +178,7 @@ def write_report(
     probe_lines = _probe_summary_lines(scalars) if scalars is not None else ["_No probe metrics available._"]
 
     # ---- Capture inventory ----
-    cap_counts = _count_captures_by_source(samples_dir)
+    cap_counts = _count_captures_by_source(captures_dir)
     capture_lines: list[str] = []
     if not cap_counts:
         capture_lines.append("_No captures found._")
@@ -267,11 +294,13 @@ def write_report(
 
     lines.append("")
     lines.append("## Artifacts")
-    lines.append(f"- scalars: `{scalars_path}`")
-    lines.append(f"- samples_dir: `{samples_dir}`")
+    lines.append(f"- scalars (wide): `{scalars_wide_path}`")
+    lines.append(f"- scalars (long): `{scalars_long_path}`")
+    lines.append(f"- captures_dir: `{captures_dir}`")
     lines.append("")
 
-    report_path = run_dir / "report.md"
+    report_path = paths.report_md_path(run_id)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines))
     return report_path
 

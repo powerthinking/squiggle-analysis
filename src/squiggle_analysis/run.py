@@ -15,19 +15,19 @@ def run_analysis(run_id: str, force: bool = False):
     End-to-end analysis for a single run.
     """
 
-    samples_dir = paths.samples_dir(run_id)
-    geometry_path = paths.geometry_state_path(run_id)
+    captures_dir = paths.captures_dir(run_id)
+    geometry_path = paths.geometry_state_long_path(run_id)
     events_path = paths.events_path(run_id)
-    report_path = paths.run_dir(run_id) / "report.md"
+    report_path = paths.report_md_path(run_id)
 
     # 0) basic existence check for v0 sanity
-    if not samples_dir.exists():
+    if not captures_dir.exists():
         raise FileNotFoundError(
-            f"No samples directory for run_id='{run_id}'. Expected: {samples_dir}\n"
-            "Run the scout training first so samples get written."
+            f"No captures directory for run_id='{run_id}'. Expected: {captures_dir}\n"
+            "Run the scout training first so captures get written."
         )
 
-    # 1) Geometry state
+    # 1) Geometry state (long-form)
     if force or not geometry_path.exists():
         compute_geometry_state(run_id)
     if not geometry_path.exists():

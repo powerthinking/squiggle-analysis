@@ -5,19 +5,19 @@ from squiggle_core.geometry.state import compute_effective_rank, compute_topk_ma
 
 
 def compute_geometry_state(run_id: str) -> None:
-    samples_root = paths.samples_dir(run_id)
+    captures_root = paths.captures_dir(run_id)
 
-    if not samples_root.exists():
+    if not captures_root.exists():
         raise FileNotFoundError(
-            f"No samples directory for run_id='{run_id}'. Expected: {samples_root}\n"
-            f"Run the scout training first so samples get written."
+            f"No captures directory for run_id='{run_id}'. Expected: {captures_root}\n"
+            f"Run the scout training first so captures get written."
         )
 
-    step_dirs = sorted(samples_root.glob("step_*"))
+    step_dirs = sorted(captures_root.glob("step_*"))
     if not step_dirs:
         raise FileNotFoundError(
-            f"Samples directory exists but has no step_* folders for run_id='{run_id}'.\n"
-            f"Expected something like: {samples_root}/step_000050/"
+            f"Captures directory exists but has no step_* folders for run_id='{run_id}'.\n"
+            f"Expected something like: {captures_root}/step_000050/"
         )
 
     rows = []
@@ -60,12 +60,12 @@ def compute_geometry_state(run_id: str) -> None:
     if not rows:
         raise RuntimeError(
             f"Found step directories for run_id='{run_id}' but no tensors were processed.\n"
-            f"Check that instrumentation is writing .pt files under: {samples_root}/step_*/"
+            f"Check that instrumentation is writing .pt files under: {captures_root}/step_*/"
         )
 
     df = pd.DataFrame(rows)
 
-    out_path = paths.geometry_state_path(run_id)
+    out_path = paths.geometry_state_long_path(run_id)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path)
 
