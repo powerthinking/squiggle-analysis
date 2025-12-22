@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pandas as pd
 from squiggle_core import paths
 
@@ -20,30 +22,25 @@ def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: floa
             f"Found columns: {list(geom.columns)}"
         )
 
+    out = paths.events_path(run_id)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Define the schema we always write (even if empty)
+    out_cols = [
+        "run_id",
+        "event_id",
+        "layer",
+        "metric",
+        "step",        # canonical event timestamp (validator/report-friendly)
+        "start_step",  # interval context
+        "end_step",
+        "score",
+        "event_type",
+    ]
+
     if geom.empty:
-        # Write an empty events parquet (nice behavior) and return
-        out = paths.events_path(run_id)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(
-            columns=[
-                "run_id",
-                "event_id",
-                "layer",
-                "metric",
-                "start_step",
-                "end_step",
-                "score",
-                "event_type",
-            ]
-        ).to_parquet(out)
+        pd.DataFrame(columns=out_cols).to_parquet(out, index=False)
         return
-
-    events = []
-    event_id = 0
-
-    # OPTIONAL: keep all metrics now that we have per-metric thresholds
-    # (Remove the effective_rank filter so topk_mass_k8 can produce events)
-    # geom = geom[geom["metric"] == "effective_rank"].copy()
 
     def _threshold_for_metric(metric_name: str) -> float:
         if metric_name == "effective_rank":
@@ -53,30 +50,61 @@ def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: floa
         # default fallback for future metrics
         return float(rank_threshold)
 
-    for (layer, metric), g in geom.groupby(["layer", "metric"]):
+    events: list[dict] = []
+    event_id = 0
+
+    # Group per (layer, metric) so thresholds apply cleanly
+    for (layer, metric), g in geom.groupby(["layer", "metric"], sort=True):
         g = g.sort_values("step")
         values = g["value"].to_numpy()
         steps = g["step"].to_numpy()
+
+        if len(values) < 2:
+            continue
 
         thr = _threshold_for_metric(str(metric))
 
         for i in range(1, len(values)):
             delta = float(values[i] - values[i - 1])
             if abs(delta) > thr:
+                start_step = int(steps[i - 1])
+                end_step = int(steps[i])
+
+                # Canonical event step: choose END by default
+                # (means "the change is observed at end_step")
+                step = end_step
+
                 events.append(
                     {
                         "run_id": run_id,
                         "event_id": f"e{event_id}",
                         "layer": int(layer),
                         "metric": str(metric),
-                        "start_step": int(steps[i - 1]),
-                        "end_step": int(steps[i]),
+                        "step": step,
+                        "start_step": start_step,
+                        "end_step": end_step,
                         "score": abs(delta),
                         "event_type": "change_point",
                     }
                 )
                 event_id += 1
 
-    out = paths.events_path(run_id)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(events).to_parquet(out)
+    df = pd.DataFrame(events)
+
+    # Always write with the same columns, even if no events were found
+    if df.empty:
+        df = pd.DataFrame(columns=out_cols)
+    else:
+        # Ensure column set/order is stable
+        for c in out_cols:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[out_cols]
+
+        # Deterministic ordering (nice for diffs + reports)
+        df = df.sort_values(["score", "layer", "metric", "step"], ascending=[False, True, True, True]).reset_index(drop=True)
+
+        # Reassign event_id after sorting so IDs correspond to report ordering (optional)
+        df["event_id"] = [f"e{i}" for i in range(len(df))]
+
+    df.to_parquet(out, index=False)

@@ -176,22 +176,37 @@ def write_report(
     if events is None or events.empty:
         events_section = "_No events detected (or events file missing)._"
     else:
-        # Prefer interval schema if present
-        if "start_step" in events.columns and "end_step" in events.columns:
-            cols = [c for c in ["run_id", "event_id", "event_type", "layer", "metric", "start_step", "end_step", "score"] if c in events.columns]
-            show = events[cols].copy()
-            if "score" in show.columns:
-                show = show.sort_values("score", ascending=False)
-            show = show.head(30)
-            events_section = show.to_markdown(index=False)
+        # Choose the most informative columns available.
+        preferred_cols = [
+            "run_id",
+            "event_id",
+            "event_type",
+            "layer",
+            "metric",
+            "step",        # canonical event timestamp (always present  in new schema)
+            "start_step",  # interval context (if present)
+            "end_step",
+            "score",
+        ]
+        cols = [c for c in preferred_cols if c in events.columns]
+
+        show = events[cols].copy()
+
+        # Stable, sensible ordering for readability
+        if "score" in show.columns:
+            show = show.sort_values(
+                by=["score", "layer", "metric", "step"] if "step" in show.columns else ["score", "layer", "metric"],
+                ascending=[False, True, True, True] if "step" in show.columns else [False, True, True],
+            )
         else:
-            # Fallback to legacy
-            cols = [c for c in ["run_id", "event_id", "event_type", "layer", "metric", "step", "score"] if c in events.columns]
-            show = events[cols].copy()
-            if "score" in show.columns:
-                show = show.sort_values("score", ascending=False)
-            show = show.head(30)
-            events_section = show.to_markdown(index=False)
+            # fallback ordering if score is missing for some reason
+            if "step" in show.columns:
+                show = show.sort_values(["layer", "metric", "step"], ascending=[True, True, True])
+            else:
+                show = show.sort_values(["layer", "metric"], ascending=[True, True])
+
+        show = show.head(30)
+        events_section = show.to_markdown(index=False)
 
     # ---- Build report ----
     lines: list[str] = []

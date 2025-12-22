@@ -30,6 +30,8 @@ def run_analysis(run_id: str, force: bool = False):
     # 1) Geometry state
     if force or not geometry_path.exists():
         compute_geometry_state(run_id)
+    if not geometry_path.exists():
+        raise RuntimeError(f"compute_geometry_state did not write: {geometry_path}")
 
     # Validate geometry after computation
     geom = pd.read_parquet(geometry_path)
@@ -38,6 +40,8 @@ def run_analysis(run_id: str, force: bool = False):
     # 2) Events
     if force or not events_path.exists():
         detect_events(run_id, rank_threshold=0.2, mass_threshold=0.03)
+    if not events_path.exists():
+        raise RuntimeError(f"detect_events did not write: {events_path}")
 
     # Validate events after computation
     events = pd.read_parquet(events_path)
