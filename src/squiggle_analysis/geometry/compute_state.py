@@ -65,7 +65,7 @@ def compute_geometry_state(run_id: str) -> None:
 
     df = pd.DataFrame(rows)
 
-    out_path = paths.geometry_state_long_path(run_id)
+    out_path = paths.geometry_state_path(run_id)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path)
 

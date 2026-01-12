@@ -118,7 +118,7 @@ def write_report(
     scalars_wide_path = paths.metrics_wide_path(run_id)
     captures_dir = paths.captures_dir(run_id)
 
-    geometry_path = paths.geometry_state_long_path(run_id)
+    geometry_path = paths.geometry_state_path(run_id)
     events_path = paths.events_path(run_id)
 
     meta = _read_json(meta_path)

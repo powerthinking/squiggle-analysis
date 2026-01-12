@@ -5,7 +5,7 @@ from squiggle_core import paths
 
 
 def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: float = 0.03) -> None:
-    geom_path = paths.geometry_state_long_path(run_id)
+    geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
         raise FileNotFoundError(
             f"Geometry state parquet not found for run_id='{run_id}'. Expected: {geom_path}\n"

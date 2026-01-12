@@ -49,7 +49,7 @@ Events are written to:
 
 Each run produces a human-readable report:
 
-- `runs/<run_id>/report.md`
+- `runs/<run_id>/reports/report.md`
 
 
 The report summarizes:

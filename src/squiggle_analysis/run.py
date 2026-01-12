@@ -16,7 +16,7 @@ def run_analysis(run_id: str, force: bool = False):
     """
 
     captures_dir = paths.captures_dir(run_id)
-    geometry_path = paths.geometry_state_long_path(run_id)
+    geometry_path = paths.geometry_state_path(run_id)
     events_path = paths.events_path(run_id)
     report_path = paths.report_md_path(run_id)
 
