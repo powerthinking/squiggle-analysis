@@ -1,0 +1,69 @@
+{
+  "manifest_version": "experiment_parquet_manifest@1.0",
+  "created_at_utc": "2026-01-12T18:02:10.123456+00:00",
+  "directory": "experiments/EXP-0123/outputs/parquet",
+  "files": {
+    "probe_summaries": {
+      "path": "probe_summaries.parquet",
+      "bytes": 4812391,
+      "rows": 2400,
+      "sha256": "..."
+    },
+    "probe_events_candidates": {
+      "path": "probe_events_candidates.parquet",
+      "bytes": 92231,
+      "rows": 180,
+      "sha256": "..."
+    }
+  },
+  "probe_summaries": {
+    "unique": {
+      "run_id": ["..."],
+      "analysis_id": ["..."],
+      "family_id": ["..."],
+      "probe_name": ["layerwise_geometry_v1"],
+      "schema_version": ["probe_summary@2.0"],
+      "signature_version": ["sig@2.0"],
+      "score_version": ["dis@1.0"]
+    },
+    "created_at_utc_minmax": {
+      "min": "2026-01-12T17:01:00+00:00",
+      "max": "2026-01-12T17:59:00+00:00"
+    },
+    "null_counts": {
+      "run_id": 0,
+      "analysis_id": 0,
+      "family_id": 0,
+      "probe_name": 0,
+      "probe_config_hash": 0,
+      "layers_covered": 0,
+      "signature_vector": 0,
+      "magnitude": 0,
+      "coherence": 0,
+      "novelty": 0,
+      "DIS": 0
+    }
+  },
+  "probe_events_candidates": {
+    "rows": 180,
+    "unique": {
+      "detector_version": ["events@0.1"],
+      "event_type": ["rank_collapse", "volatility_spike"]
+    },
+    "created_at_utc_minmax": {
+      "min": "2026-01-12T17:01:00+00:00",
+      "max": "2026-01-12T17:59:00+00:00"
+    },
+    "null_counts": {
+      "run_id": 0,
+      "analysis_id": 0,
+      "family_id": 0,
+      "probe_name": 0,
+      "event_id": 0,
+      "event_type": 0,
+      "t_step": 0,
+      "layers": 0,
+      "strength": 0
+    }
+  }
+}
