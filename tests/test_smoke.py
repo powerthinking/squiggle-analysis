@@ -19,5 +19,5 @@ def test_analysis_writes_expected_artifacts(tmp_path, monkeypatch):
     run_analysis(run_id=run_id, force=True)
 
     assert paths.geometry_state_path(run_id).exists()
-    assert paths.events_path(run_id).exists()
+    assert paths.events_candidates_path(run_id).exists()
     assert paths.report_md_path(run_id).exists()

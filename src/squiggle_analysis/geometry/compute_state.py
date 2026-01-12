@@ -1,10 +1,12 @@
+from datetime import datetime, timezone
+
 import pandas as pd
 from squiggle_core import paths
 from squiggle_core.geometry.state import compute_effective_rank, compute_topk_mass
 
 
 
-def compute_geometry_state(run_id: str) -> None:
+def compute_geometry_state(run_id: str, *, analysis_id: str = "analysis@2.0") -> None:
     captures_root = paths.captures_dir(run_id)
 
     if not captures_root.exists():
@@ -21,6 +23,9 @@ def compute_geometry_state(run_id: str) -> None:
         )
 
     rows = []
+
+    created_at_utc = datetime.now(timezone.utc)
+    schema_version = "geometry_state@2.0"
 
     for step_dir in step_dirs:
         try:
@@ -41,6 +46,9 @@ def compute_geometry_state(run_id: str) -> None:
             rows.append(
                 {
                     "run_id": run_id,
+                    "analysis_id": analysis_id,
+                    "schema_version": schema_version,
+                    "created_at_utc": created_at_utc,
                     "step": step,
                     "layer": layer,
                     "metric": "effective_rank",
@@ -50,6 +58,9 @@ def compute_geometry_state(run_id: str) -> None:
             rows.append(
                 {
                     "run_id": run_id,
+                    "analysis_id": analysis_id,
+                    "schema_version": schema_version,
+                    "created_at_utc": created_at_utc,
                     "step": step,
                     "layer": layer,
                     "metric": "topk_mass_k8",

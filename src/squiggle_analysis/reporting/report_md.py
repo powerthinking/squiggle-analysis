@@ -119,7 +119,7 @@ def write_report(
     captures_dir = paths.captures_dir(run_id)
 
     geometry_path = paths.geometry_state_path(run_id)
-    events_path = paths.events_path(run_id)
+    events_candidates_path = paths.events_candidates_path(run_id)
 
     meta = _read_json(meta_path)
     scalars_wide = _try_read_parquet(scalars_wide_path)
@@ -152,7 +152,7 @@ def write_report(
     if geom is None:
         geom = _try_read_parquet(geometry_path)
     if events is None:
-        events = _try_read_parquet(events_path)
+        events = _try_read_parquet(events_candidates_path)
 
     # ---- Scalars summary ----
     scalar_lines: list[str] = []
@@ -289,7 +289,7 @@ def write_report(
     lines.append("## Events")
     lines.append(events_section)
     lines.append("")
-    lines.append(f"- events: `{events_path}`")
+    lines.append(f"- events_candidates: `{events_candidates_path}`")
 
     lines.append("")
     lines.append("## Artifacts")

@@ -11,20 +11,156 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from squiggle_core.schemas.probe_summary_v2 import (
+from squiggle_core.schemas.probe_summar import (
     ProbeSummary,
-    probe_summary_to_probe_summaries_row,
     probe_summary_to_probe_events_candidate_rows,
+    probe_summary_to_probe_summaries_row,
 )
-from squiggle_core.parquet.probe_tables_v2 import (
-    probe_summaries_schema,
+from squiggle_core.schemas.probe_tables import (
     probe_events_candidates_schema,
+    probe_summaries_schema,
 )
 
-# (keep the casting + IO helpers from previous version)
-# ... _cast_list, _f32, _i16, _i32, _i64 ...
-# ... _normalize_probe_summaries_row, _normalize_probe_events_row ...
-# ... _iter_json_files, _load_probe_summary_json, _build_tables_from_json_dir ...
+
+def _cast_list(xs: Any, f) -> List[Any]:
+    if xs is None:
+        return []
+    if not isinstance(xs, list):
+        raise TypeError(f"Expected list, got {type(xs)}")
+    return [f(x) for x in xs]
+
+
+def _f32(x: Any) -> float:
+    if x is None:
+        return float("nan")
+    return float(x)
+
+
+def _i16(x: Any) -> int:
+    return int(x)
+
+
+def _i32(x: Any) -> int:
+    return int(x)
+
+
+def _i64(x: Any) -> int:
+    return int(x)
+
+
+def _normalize_probe_summaries_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+
+    for k in [
+        "seed",
+        "steps",
+    ]:
+        if k in out and out[k] is not None:
+            out[k] = _i32(out[k])
+
+    if "capture_steps_used" in out and out["capture_steps_used"] is not None:
+        out["capture_steps_used"] = _cast_list(out["capture_steps_used"], _i64)
+
+    if "layers_covered" in out and out["layers_covered"] is not None:
+        out["layers_covered"] = _cast_list(out["layers_covered"], _i16)
+
+    if "affected_layers" in out and out["affected_layers"] is not None:
+        out["affected_layers"] = _cast_list(out["affected_layers"], _i16)
+
+    list_f32_cols = [
+        "A_eff_rank_pre",
+        "A_eff_rank_post",
+        "A_eff_rank_delta",
+        "A_sv_entropy_pre",
+        "A_sv_entropy_post",
+        "A_sv_entropy_delta",
+        "A_sparsity_pre",
+        "A_sparsity_post",
+        "A_sparsity_delta",
+        "A_principal_angle_post_vs_pre",
+        "B_drift_velocity_by_layer",
+        "B_drift_accel_by_layer",
+        "B_volatility_by_layer",
+        "B_alignment_velocity_by_layer",
+        "signature_vector",
+    ]
+    for c in list_f32_cols:
+        if c in out and out[c] is not None:
+            out[c] = _cast_list(out[c], _f32)
+
+    f32_cols = [
+        "B_drift_velocity_global",
+        "B_drift_accel_global",
+        "B_volatility_global",
+        "B_alignment_velocity_global",
+        "signature_norm",
+        "magnitude",
+        "coherence",
+        "novelty",
+        "DIS",
+    ]
+    for c in f32_cols:
+        if c in out and out[c] is not None:
+            out[c] = _f32(out[c])
+
+    return out
+
+
+def _normalize_probe_events_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    if "seed" in out and out["seed"] is not None:
+        out["seed"] = _i32(out["seed"])
+    if "timewarp_tolerance_steps" in out and out["timewarp_tolerance_steps"] is not None:
+        out["timewarp_tolerance_steps"] = _i32(out["timewarp_tolerance_steps"])
+    if "t_step" in out and out["t_step"] is not None:
+        out["t_step"] = _i64(out["t_step"])
+    if "layers" in out and out["layers"] is not None:
+        out["layers"] = _cast_list(out["layers"], _i16)
+    if "strength" in out and out["strength"] is not None:
+        out["strength"] = _f32(out["strength"])
+    if "supporting_key" in out and out["supporting_key"] is None:
+        out["supporting_key"] = []
+    if "supporting_val" in out and out["supporting_val"] is not None:
+        out["supporting_val"] = _cast_list(out["supporting_val"], _f32)
+    return out
+
+
+def _iter_json_files(root: Path) -> Iterable[Path]:
+    if not root.exists():
+        return []
+    files = sorted(root.glob("*.json"))
+    for p in files:
+        if p.name.startswith("_"):
+            continue
+        yield p
+
+
+def _load_probe_summary_json(path: Path, *, strict: bool = True) -> Optional[ProbeSummary]:
+    try:
+        txt = path.read_text(encoding="utf-8")
+        return ProbeSummary.model_validate_json(txt)
+    except Exception:
+        if strict:
+            raise
+        return None
+
+
+def _build_tables_from_json_dir(summaries_dir: Path, *, strict: bool = True) -> Tuple[pa.Table, pa.Table]:
+    probe_rows: List[Dict[str, Any]] = []
+    event_rows: List[Dict[str, Any]] = []
+
+    for path in _iter_json_files(summaries_dir):
+        ps = _load_probe_summary_json(path, strict=strict)
+        if ps is None:
+            continue
+
+        probe_rows.append(_normalize_probe_summaries_row(probe_summary_to_probe_summaries_row(ps)))
+        for r in probe_summary_to_probe_events_candidate_rows(ps):
+            event_rows.append(_normalize_probe_events_row(r))
+
+    probe_table = pa.Table.from_pylist(probe_rows, schema=probe_summaries_schema)
+    event_table = pa.Table.from_pylist(event_rows, schema=probe_events_candidates_schema)
+    return probe_table, event_table
 
 
 def _utc_now() -> datetime:

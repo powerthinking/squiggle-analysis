@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pandas as pd
 from squiggle_core import paths
 
 
-def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: float = 0.03) -> None:
+def detect_events(
+    run_id: str,
+    *,
+    analysis_id: str = "analysis@2.0",
+    rank_threshold: float = 0.2,
+    mass_threshold: float = 0.03,
+) -> None:
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
         raise FileNotFoundError(
@@ -14,7 +22,16 @@ def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: floa
 
     geom = pd.read_parquet(geom_path)
 
-    required = {"run_id", "step", "layer", "metric", "value"}
+    required = {
+        "run_id",
+        "analysis_id",
+        "schema_version",
+        "created_at_utc",
+        "step",
+        "layer",
+        "metric",
+        "value",
+    }
     missing = required - set(geom.columns)
     if missing:
         raise ValueError(
@@ -22,12 +39,18 @@ def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: floa
             f"Found columns: {list(geom.columns)}"
         )
 
-    out = paths.events_path(run_id)
+    out = paths.events_candidates_path(run_id)
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    created_at_utc = datetime.now(timezone.utc)
+    schema_version = "events_candidates@2.0"
 
     # Define the schema we always write (even if empty)
     out_cols = [
         "run_id",
+        "analysis_id",
+        "schema_version",
+        "created_at_utc",
         "event_id",
         "layer",
         "metric",
@@ -77,6 +100,9 @@ def detect_events(run_id: str, rank_threshold: float = 0.2, mass_threshold: floa
                 events.append(
                     {
                         "run_id": run_id,
+                        "analysis_id": analysis_id,
+                        "schema_version": schema_version,
+                        "created_at_utc": created_at_utc,
                         "event_id": f"e{event_id}",
                         "layer": int(layer),
                         "metric": str(metric),

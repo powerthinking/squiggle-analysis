@@ -42,7 +42,7 @@ Events detect significant geometric change over time.
 
 Events are written to:
 
-- `events/<run_id>.parquet` 
+- `events_candidates/<run_id>.parquet` 
 
 
 ## Reporting
