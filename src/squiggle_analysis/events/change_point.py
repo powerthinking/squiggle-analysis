@@ -4,12 +4,18 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from squiggle_core import paths
+from squiggle_core.scoring.squiggle_scoring import (
+    ScoringConfig,
+    build_baselines_from_samples,
+    compute_event_score,
+ )
 
 
 def detect_events(
     run_id: str,
     *,
     analysis_id: str = "analysis@2.0",
+    baseline_run_id: str | None = None,
     rank_threshold: float = 0.2,
     mass_threshold: float = 0.03,
 ) -> None:
@@ -57,13 +63,53 @@ def detect_events(
         "step",        # canonical event timestamp (validator/report-friendly)
         "start_step",  # interval context
         "end_step",
-        "score",
         "event_type",
+        "score",
+
+        "magnitude",
+        "structure_modifier",
+        "magnitude_eff",
+        "coherence",
+        "novelty",
+
+        "metric_size",
+        "metric_z",
+        "baseline_median",
+        "baseline_mad",
+
+        "volatility_event",
+        "volatility_baseline",
+        "volatility_ratio",
+        "volatility_ratio_agg",
     ]
 
     if geom.empty:
         pd.DataFrame(columns=out_cols).to_parquet(out, index=False)
         return
+
+    baseline_geom = geom
+    if baseline_run_id is not None:
+        baseline_geom_path = paths.geometry_state_path(baseline_run_id)
+        if not baseline_geom_path.exists():
+            raise FileNotFoundError(
+                f"Geometry state parquet not found for baseline_run_id='{baseline_run_id}'. Expected: {baseline_geom_path}"
+            )
+        baseline_geom = pd.read_parquet(baseline_geom_path)
+
+    size_samples: dict[str, list[float]] = {}
+    for (_, metric), g in baseline_geom.groupby(["layer", "metric"], sort=True):
+        g = g.sort_values("step")
+        values = g["value"].to_numpy()
+        if len(values) < 2:
+            continue
+        ds = [float(abs(values[i] - values[i - 1])) for i in range(1, len(values))]
+        if not ds:
+            continue
+        key = str(metric)
+        size_samples.setdefault(key, []).extend(ds)
+
+    baselines = build_baselines_from_samples(size_samples)
+    scoring_cfg = ScoringConfig(use_structure_modifier=False)
 
     def _threshold_for_metric(metric_name: str) -> float:
         if metric_name == "effective_rank":
@@ -97,6 +143,28 @@ def detect_events(
                 # (means "the change is observed at end_step")
                 step = end_step
 
+                metric_key = str(metric)
+                metric_size = float(abs(delta))
+
+                breakdown = None
+                baseline_med = None
+                baseline_mad = None
+                metric_z = None
+
+                if metric_key in baselines:
+                    b = baselines[metric_key]
+                    baseline_med = float(b.median)
+                    baseline_mad = float(b.mad)
+                    breakdown = compute_event_score(
+                        metric_sizes={metric_key: metric_size},
+                        baselines={metric_key: b},
+                        cfg=scoring_cfg,
+                    )
+                    score = float(breakdown.score)
+                    metric_z = float(breakdown.metric_z.get(metric_key, 0.0))
+                else:
+                    score = metric_size
+
                 events.append(
                     {
                         "run_id": run_id,
@@ -109,8 +177,25 @@ def detect_events(
                         "step": step,
                         "start_step": start_step,
                         "end_step": end_step,
-                        "score": abs(delta),
                         "event_type": "change_point",
+
+                        "score": score,
+
+                        "magnitude": (float(breakdown.magnitude) if breakdown else None),
+                        "structure_modifier": (float(breakdown.structure_modifier) if breakdown else None),
+                        "magnitude_eff": (float(breakdown.magnitude_eff) if breakdown else None),
+                        "coherence": (float(breakdown.coherence) if breakdown else None),
+                        "novelty": (float(breakdown.novelty) if breakdown else None),
+
+                        "metric_size": metric_size,
+                        "metric_z": metric_z,
+                        "baseline_median": baseline_med,
+                        "baseline_mad": baseline_mad,
+
+                        "volatility_event": None,
+                        "volatility_baseline": None,
+                        "volatility_ratio": None,
+                        "volatility_ratio_agg": None,
                     }
                 )
                 event_id += 1
