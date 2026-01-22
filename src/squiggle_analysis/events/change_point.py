@@ -144,9 +144,6 @@ def detect_events(
 
     required = {
         "run_id",
-        "analysis_id",
-        "schema_version",
-        "created_at_utc",
         "step",
         "layer",
         "metric",
@@ -158,6 +155,13 @@ def detect_events(
             f"Geometry state is missing required columns: {sorted(missing)}\n"
             f"Found columns: {list(geom.columns)}"
         )
+
+    if "analysis_id" not in geom.columns:
+        geom["analysis_id"] = analysis_id
+    if "schema_version" not in geom.columns:
+        geom["schema_version"] = "geometry_state@unknown"
+    if "created_at_utc" not in geom.columns:
+        geom["created_at_utc"] = datetime.now(timezone.utc)
 
     out = paths.events_candidates_path(run_id)
     out.parent.mkdir(parents=True, exist_ok=True)
