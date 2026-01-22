@@ -182,14 +182,14 @@ def _unique_list(table: pa.Table, col: str, *, limit: int = 50000) -> List[Any]:
     if col not in table.column_names:
         return []
     arr = table[col]
-    if arr.num_chunks > 1:
+    if isinstance(arr, pa.ChunkedArray) and arr.num_chunks > 1:
         arr = arr.combine_chunks()
     # Drop nulls
     arr = pc.drop_null(arr)
     if len(arr) == 0:
         return []
     u = pc.unique(arr)
-    if u.num_chunks > 1:
+    if isinstance(u, pa.ChunkedArray) and u.num_chunks > 1:
         u = u.combine_chunks()
     if len(u) > limit:
         # don’t explode manifests
@@ -224,9 +224,10 @@ def _null_counts(table: pa.Table, cols: List[str]) -> Dict[str, int]:
         if c not in table.column_names:
             continue
         arr = table[c]
-        if arr.num_chunks > 1:
+        if isinstance(arr, pa.ChunkedArray) and arr.num_chunks > 1:
             arr = arr.combine_chunks()
-        out[c] = int(pc.sum(pc.is_null(arr)).as_py())
+        s = pc.sum(pc.is_null(arr)).as_py()
+        out[c] = int(0 if s is None else s)
     return out
 
 
