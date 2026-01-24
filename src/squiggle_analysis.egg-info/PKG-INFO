@@ -58,16 +58,25 @@ Events detect significant geometric change over time.
 - Metric-aware thresholds
 - Layer-specific
 
+Event candidates are scored using the shared scoring implementation in `squiggle_core.scoring`.
+
+Supported event types:
+- `change_point` (single metric)
+- `change_point_composite` (multi-metric; `metric = __composite__`)
+
 Events are written to:
 
-- `events/<run_id>.parquet` 
+- `events_candidates/<run_id>.parquet` 
+
+Optional baseline usage:
+- score against a designated baseline run (`baseline_run_id`) or a persisted baseline artifact (`baseline_id`)
 
 
 ## Reporting
 
 Each run produces a human-readable report:
 
-- `runs/<run_id>/report.md`
+- `runs/<run_id>/reports/report.md`
 
 
 The report summarizes:

@@ -11,5 +11,6 @@ src/squiggle_analysis.egg-info/requires.txt
 src/squiggle_analysis.egg-info/top_level.txt
 src/squiggle_analysis/events/change_point.py
 src/squiggle_analysis/geometry/compute_state.py
+src/squiggle_analysis/io/write_probe_parquet_per_experiment.py
 src/squiggle_analysis/reporting/report_md.py
 tests/test_smoke.py
