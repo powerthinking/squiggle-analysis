@@ -252,11 +252,8 @@ def analyze_event_phases(run: RunData) -> Dict[str, any]:
     """
     Analyze event distribution across training phases.
 
-    Phases:
-    - warmup: 0 to warmup_end
-    - high_lr: warmup_end to decay (for constant LR, this is entire training)
-    - decay: decay_start to floor_start (for cosine)
-    - floor: floor_start to end
+    Uses event_phase column if available (shaping/transition/locking),
+    otherwise falls back to LR-based phases (warmup/high_lr/floor).
 
     Returns dict with:
     - phase_counts: events per phase
@@ -277,15 +274,6 @@ def analyze_event_phases(run: RunData) -> Dict[str, any]:
     steps_per_epoch = meta.get("steps_per_epoch", 0)
     epochs = meta.get("epochs", 1)
 
-    # Classify events into phases
-    def get_phase(step: int) -> str:
-        if step < warmup_end:
-            return "warmup"
-        elif step < floor_start:
-            return "high_lr"
-        else:
-            return "floor"
-
     if events_df.empty:
         return {
             "phase_counts": {"warmup": 0, "high_lr": 0, "floor": 0},
@@ -294,10 +282,24 @@ def analyze_event_phases(run: RunData) -> Dict[str, any]:
             "phase_boundaries": phase_boundaries,
         }
 
-    # Count events per phase
     events_df = events_df.copy()
-    events_df["phase"] = events_df["step"].apply(get_phase)
-    phase_counts = events_df["phase"].value_counts().to_dict()
+
+    # Use new event_phase column if available, otherwise compute from step
+    if "event_phase" in events_df.columns and events_df["event_phase"].notna().any():
+        # Map event_phase to display format
+        phase_counts = events_df["event_phase"].value_counts().to_dict()
+    else:
+        # Fallback: classify events into LR-based phases
+        def get_phase(step: int) -> str:
+            if step < warmup_end:
+                return "warmup"
+            elif step < floor_start:
+                return "high_lr"
+            else:
+                return "floor"
+
+        events_df["phase"] = events_df["step"].apply(get_phase)
+        phase_counts = events_df["phase"].value_counts().to_dict()
 
     # Check for boundary events (within 5 steps of any boundary)
     boundary_tolerance = 5
@@ -559,24 +561,42 @@ def generate_comparison_report(
     # Phase Analysis Section
     lines.append("## Event Phase Analysis")
     lines.append("")
-    lines.append("Events classified by training phase (warmup, high_lr, floor).")
-    lines.append("")
 
     phase_analyses = [analyze_event_phases(run) for run in runs]
     any_schedule_warning = any(pa["schedule_artifact_warning"] for pa in phase_analyses)
 
-    # Build phase table
-    lines.append("| Run | Warmup | High LR | Floor | Boundary Events | Warning |")
-    lines.append("|-----|--------|---------|-------|-----------------|---------|")
+    # Detect which phase naming convention is used
+    first_phase_counts = phase_analyses[0]["phase_counts"]
+    use_new_phases = "shaping" in first_phase_counts or "locking" in first_phase_counts
 
-    for run, pa in zip(runs, phase_analyses):
-        short_id = run.run_id[:15] + "..." if len(run.run_id) > 18 else run.run_id
-        warmup_count = pa["phase_counts"].get("warmup", 0)
-        high_lr_count = pa["phase_counts"].get("high_lr", 0)
-        floor_count = pa["phase_counts"].get("floor", 0)
-        boundary_pct = pa["boundary_fraction"] * 100
-        warning = "Yes" if pa["schedule_artifact_warning"] else "-"
-        lines.append(f"| {short_id} | {warmup_count} | {high_lr_count} | {floor_count} | {boundary_pct:.0f}% | {warning} |")
+    if use_new_phases:
+        lines.append("Events classified by training phase (shaping, transition, locking).")
+        lines.append("")
+        lines.append("| Run | Shaping | Transition | Locking | Boundary Events | Warning |")
+        lines.append("|-----|---------|------------|---------|-----------------|---------|")
+
+        for run, pa in zip(runs, phase_analyses):
+            short_id = run.run_id[:15] + "..." if len(run.run_id) > 18 else run.run_id
+            shaping_count = pa["phase_counts"].get("shaping", 0)
+            transition_count = pa["phase_counts"].get("transition", 0)
+            locking_count = pa["phase_counts"].get("locking", 0)
+            boundary_pct = pa["boundary_fraction"] * 100
+            warning = "Yes" if pa["schedule_artifact_warning"] else "-"
+            lines.append(f"| {short_id} | {shaping_count} | {transition_count} | {locking_count} | {boundary_pct:.0f}% | {warning} |")
+    else:
+        lines.append("Events classified by training phase (warmup, high_lr, floor).")
+        lines.append("")
+        lines.append("| Run | Warmup | High LR | Floor | Boundary Events | Warning |")
+        lines.append("|-----|--------|---------|-------|-----------------|---------|")
+
+        for run, pa in zip(runs, phase_analyses):
+            short_id = run.run_id[:15] + "..." if len(run.run_id) > 18 else run.run_id
+            warmup_count = pa["phase_counts"].get("warmup", 0)
+            high_lr_count = pa["phase_counts"].get("high_lr", 0)
+            floor_count = pa["phase_counts"].get("floor", 0)
+            boundary_pct = pa["boundary_fraction"] * 100
+            warning = "Yes" if pa["schedule_artifact_warning"] else "-"
+            lines.append(f"| {short_id} | {warmup_count} | {high_lr_count} | {floor_count} | {boundary_pct:.0f}% | {warning} |")
 
     lines.append("")
 

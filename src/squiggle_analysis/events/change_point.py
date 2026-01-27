@@ -296,7 +296,7 @@ def detect_events(
     local_baseline_fraction: float | None = 0.15,  # Alternative: ±15% of total steps
     composite_stabilization_steps: int = 10,  # Delay composite detection until this many steps
     min_event_separation: int = 5,  # Minimum steps between events of same type
-) -> None:
+) -> Optional[EventEntropyMetrics]:
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
         raise FileNotFoundError(
@@ -385,7 +385,7 @@ def detect_events(
 
     if geom.empty:
         pd.DataFrame(columns=out_cols).to_parquet(out, index=False)
-        return
+        return None
 
     # Compute total steps for local baseline window calculation
     total_steps = int(geom["step"].max() - geom["step"].min()) if len(geom) > 1 else 1
@@ -801,3 +801,9 @@ def detect_events(
         df["event_id"] = [f"e{i}" for i in range(len(df))]
 
     df.to_parquet(out, index=False)
+
+    # Compute and return event entropy metrics
+    n_layers = int(geom["layer"].nunique()) if "layer" in geom.columns else 1
+    entropy_metrics = compute_event_entropy(df, total_steps, n_layers)
+
+    return entropy_metrics
