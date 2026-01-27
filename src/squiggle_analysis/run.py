@@ -10,9 +10,23 @@ from .events.change_point import detect_events
 from .reporting.report_md import write_report
 
 
-def run_analysis(run_id: str, force: bool = False, *, analysis_id: str = "analysis@2.0"):
+def run_analysis(
+    run_id: str,
+    force: bool = False,
+    *,
+    analysis_id: str = "analysis@2.0",
+    baseline_run_id: str | None = None,
+    baseline_id: str | None = None,
+):
     """
     End-to-end analysis for a single run.
+
+    Args:
+        run_id: The run to analyze
+        force: Recompute all artifacts even if they exist
+        analysis_id: Version identifier for this analysis
+        baseline_run_id: Use another run's geometry as scoring baseline
+        baseline_id: Load a persisted baseline file by ID
     """
 
     captures_dir = paths.captures_dir(run_id)
@@ -37,9 +51,16 @@ def run_analysis(run_id: str, force: bool = False, *, analysis_id: str = "analys
     geom = pd.read_parquet(geometry_path)
     parquet_schemas.validate_geometry_state_df(geom)
 
-    # 2) Events
+    # 2) Events (with optional cross-run baseline)
     if force or not events_candidates_path.exists():
-        detect_events(run_id, analysis_id=analysis_id, rank_threshold=0.2, mass_threshold=0.03)
+        detect_events(
+            run_id,
+            analysis_id=analysis_id,
+            baseline_run_id=baseline_run_id,
+            baseline_id=baseline_id,
+            rank_threshold=0.2,
+            mass_threshold=0.03,
+        )
     if not events_candidates_path.exists():
         raise RuntimeError(f"detect_events did not write: {events_candidates_path}")
 

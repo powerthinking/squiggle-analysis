@@ -6,7 +6,22 @@ from squiggle_core.geometry.state import compute_effective_rank, compute_topk_ma
 
 
 
-def compute_geometry_state(run_id: str, *, analysis_id: str = "analysis@2.0") -> None:
+def compute_geometry_state(
+    run_id: str,
+    *,
+    analysis_id: str = "analysis@2.0",
+    components: list[str] | None = None,
+) -> None:
+    """
+    Compute geometry state metrics for a training run.
+
+    Args:
+        run_id: The run to analyze
+        analysis_id: Version identifier for this analysis
+        components: List of tensor components to analyze. If None, defaults to
+                   residual stream tensors (x_out, resid). Pass ["all"] to analyze
+                   all available components.
+    """
     captures_root = paths.captures_dir(run_id)
 
     if not captures_root.exists():
@@ -21,6 +36,14 @@ def compute_geometry_state(run_id: str, *, analysis_id: str = "analysis@2.0") ->
             f"Captures directory exists but has no step_* folders for run_id='{run_id}'.\n"
             f"Expected something like: {captures_root}/step_000050/"
         )
+
+    # Default to residual stream components
+    if components is None:
+        target_components = {DEFAULT_COMPONENT} | LEGACY_COMPONENTS
+    elif components == ["all"]:
+        target_components = None  # Process all
+    else:
+        target_components = set(components)
 
     rows = []
 
@@ -39,6 +62,12 @@ def compute_geometry_state(run_id: str, *, analysis_id: str = "analysis@2.0") ->
             continue
 
         for tensor_path in tensor_files:
+            component = parse_component(tensor_path.name)
+
+            # Filter by component if specified
+            if target_components is not None and component not in target_components:
+                continue
+
             layer = parse_layer(tensor_path.name)
             rank = compute_effective_rank(tensor_path)
             topk = compute_topk_mass(tensor_path, k=8)
@@ -86,6 +115,7 @@ def parse_layer(filename: str) -> int:
     For thin slice, we support filenames like:
       - resid_layer_03.pt
       - layer_3_resid.pt
+      - layer_00_x_out.pt
     If no layer is found, return -1.
     """
     parts = filename.replace(".pt", "").split("_")
@@ -95,4 +125,43 @@ def parse_layer(filename: str) -> int:
         if p.isdigit():
             return int(p)
     return -1
+
+
+def parse_component(filename: str) -> str:
+    """
+    Extract the component type from tensor filename.
+    Examples:
+      - resid_layer_03.pt -> "resid"
+      - layer_00_x_out.pt -> "x_out"
+      - layer_00_attn_out.pt -> "attn_out"
+      - layer_00_mlp_out.pt -> "mlp_out"
+      - embed.pt -> "embed"
+    """
+    name = filename.replace(".pt", "")
+    parts = name.split("_")
+
+    # Handle "embed" special case
+    if name == "embed":
+        return "embed"
+
+    # Find layer index and extract component after it
+    for i, p in enumerate(parts):
+        if p.lower() == "layer" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            # Component is everything after layer number
+            if i + 2 < len(parts):
+                return "_".join(parts[i + 2:])
+            return "resid"  # Default if nothing follows layer number
+
+    # Legacy: component before layer (e.g., resid_layer_03)
+    if "layer" in [p.lower() for p in parts]:
+        layer_idx = next(i for i, p in enumerate(parts) if p.lower() == "layer")
+        if layer_idx > 0:
+            return "_".join(parts[:layer_idx])
+
+    return "unknown"
+
+
+# Default to x_out (residual stream) for geometry analysis
+DEFAULT_COMPONENT = "x_out"
+LEGACY_COMPONENTS = {"resid", "resid_layer"}  # Older naming conventions
 
