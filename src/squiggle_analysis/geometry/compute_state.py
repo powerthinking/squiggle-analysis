@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from squiggle_core import paths
-from squiggle_core.geometry.state import compute_effective_rank, compute_topk_mass
+from squiggle_core.geometry.state import compute_effective_rank, compute_topk_mass, compute_sv_entropy
 
 
 
@@ -71,31 +71,19 @@ def compute_geometry_state(
             layer = parse_layer(tensor_path.name)
             rank = compute_effective_rank(tensor_path)
             topk = compute_topk_mass(tensor_path, k=8)
+            entropy = compute_sv_entropy(tensor_path)
 
-            rows.append(
-                {
-                    "run_id": run_id,
-                    "analysis_id": analysis_id,
-                    "schema_version": schema_version,
-                    "created_at_utc": created_at_utc,
-                    "step": step,
-                    "layer": layer,
-                    "metric": "effective_rank",
-                    "value": rank,
-                }
-            )
-            rows.append(
-                {
-                    "run_id": run_id,
-                    "analysis_id": analysis_id,
-                    "schema_version": schema_version,
-                    "created_at_utc": created_at_utc,
-                    "step": step,
-                    "layer": layer,
-                    "metric": "topk_mass_k8",
-                    "value": topk,
-                }
-            )
+            base_row = {
+                "run_id": run_id,
+                "analysis_id": analysis_id,
+                "schema_version": schema_version,
+                "created_at_utc": created_at_utc,
+                "step": step,
+                "layer": layer,
+            }
+            rows.append({**base_row, "metric": "effective_rank", "value": rank})
+            rows.append({**base_row, "metric": "topk_mass_k8", "value": topk})
+            rows.append({**base_row, "metric": "sv_entropy", "value": entropy})
 
     if not rows:
         raise RuntimeError(
