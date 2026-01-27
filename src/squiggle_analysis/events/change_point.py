@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
+from typing import Optional
 
 import pandas as pd
 from squiggle_core import paths
@@ -118,6 +121,162 @@ def _median(xs: list[float]) -> float:
     return float(xs[len(xs) // 2])
 
 
+def _mad(xs: list[float]) -> float:
+    """Median Absolute Deviation."""
+    if not xs:
+        return 0.0
+    med = _median(xs)
+    devs = [abs(x - med) for x in xs]
+    return _median(devs)
+
+
+def _compute_local_baseline(
+    deltas: list[float],
+    center_idx: int,
+    window_size: int,
+) -> tuple[float, float]:
+    """Compute local baseline (median, MAD) around a center index.
+
+    Returns (median, mad) for the local window.
+    """
+    n = len(deltas)
+    start = max(0, center_idx - window_size)
+    end = min(n, center_idx + window_size + 1)
+    local_deltas = deltas[start:end]
+    if not local_deltas:
+        return 0.0, 1.0
+    med = _median(local_deltas)
+    mad = _mad(local_deltas)
+    if mad < 1e-8:
+        mad = 1e-8  # Prevent division by zero
+    return med, mad
+
+
+@dataclass
+class EventEntropyMetrics:
+    """Summary metrics for event distribution (entropy-based)."""
+
+    n_events: int
+    n_single_metric: int
+    n_composite: int
+
+    # Temporal entropy: variance of event steps (normalized by total steps)
+    step_variance: float  # Raw variance of event steps
+    step_cv: float  # Coefficient of variation (std/mean)
+    temporal_entropy: float  # Entropy of step distribution (binned)
+
+    # Layer entropy: how spread out are events across layers
+    layer_entropy: float  # Shannon entropy of layer distribution
+    layer_coverage: float  # Fraction of layers with at least one event
+
+    # Metric entropy: diversity of metrics triggering events
+    metric_entropy: float  # Shannon entropy of metric distribution
+    n_unique_metrics: int
+
+    # Phase distribution
+    n_shaping: int
+    n_transition: int
+    n_locking: int
+
+
+def _shannon_entropy(counts: list[int]) -> float:
+    """Compute Shannon entropy from counts."""
+    total = sum(counts)
+    if total == 0:
+        return 0.0
+    probs = [c / total for c in counts if c > 0]
+    return -sum(p * math.log2(p) for p in probs)
+
+
+def compute_event_entropy(events_df: pd.DataFrame, total_steps: int, n_layers: int) -> EventEntropyMetrics:
+    """Compute entropy-based summary metrics for events."""
+    if events_df.empty:
+        return EventEntropyMetrics(
+            n_events=0,
+            n_single_metric=0,
+            n_composite=0,
+            step_variance=0.0,
+            step_cv=0.0,
+            temporal_entropy=0.0,
+            layer_entropy=0.0,
+            layer_coverage=0.0,
+            metric_entropy=0.0,
+            n_unique_metrics=0,
+            n_shaping=0,
+            n_transition=0,
+            n_locking=0,
+        )
+
+    n_events = len(events_df)
+    single_metric_mask = events_df["event_type"] == "change_point"
+    n_single_metric = int(single_metric_mask.sum())
+    n_composite = n_events - n_single_metric
+
+    # Temporal metrics
+    steps = events_df["step"].to_numpy()
+    if len(steps) > 1:
+        step_mean = float(steps.mean())
+        step_std = float(steps.std())
+        step_variance = float(steps.var())
+        step_cv = step_std / step_mean if step_mean > 0 else 0.0
+    else:
+        step_variance = 0.0
+        step_cv = 0.0
+
+    # Temporal entropy: bin steps into ~10 bins and compute entropy
+    n_bins = min(10, max(1, total_steps // 5))
+    if n_bins > 0 and total_steps > 0:
+        bin_edges = [i * total_steps / n_bins for i in range(n_bins + 1)]
+        bin_counts = [0] * n_bins
+        for s in steps:
+            bin_idx = min(int(s * n_bins / total_steps), n_bins - 1)
+            bin_counts[bin_idx] += 1
+        temporal_entropy = _shannon_entropy(bin_counts)
+    else:
+        temporal_entropy = 0.0
+
+    # Layer metrics
+    layer_counts: dict[int, int] = {}
+    for layer in events_df["layer"]:
+        layer_counts[layer] = layer_counts.get(layer, 0) + 1
+    layer_entropy = _shannon_entropy(list(layer_counts.values()))
+    layer_coverage = len(layer_counts) / n_layers if n_layers > 0 else 0.0
+
+    # Metric metrics (exclude __composite__)
+    metrics_series = events_df[events_df["metric"] != "__composite__"]["metric"]
+    metric_counts: dict[str, int] = {}
+    for m in metrics_series:
+        metric_counts[m] = metric_counts.get(m, 0) + 1
+    metric_entropy = _shannon_entropy(list(metric_counts.values()))
+    n_unique_metrics = len(metric_counts)
+
+    # Phase distribution
+    n_shaping = 0
+    n_transition = 0
+    n_locking = 0
+    if "event_phase" in events_df.columns:
+        phase_counts = events_df["event_phase"].value_counts()
+        n_shaping = int(phase_counts.get("shaping", 0))
+        n_transition = int(phase_counts.get("transition", 0))
+        n_locking = int(phase_counts.get("locking", 0))
+
+    return EventEntropyMetrics(
+        n_events=n_events,
+        n_single_metric=n_single_metric,
+        n_composite=n_composite,
+        step_variance=step_variance,
+        step_cv=step_cv,
+        temporal_entropy=temporal_entropy,
+        layer_entropy=layer_entropy,
+        layer_coverage=layer_coverage,
+        metric_entropy=metric_entropy,
+        n_unique_metrics=n_unique_metrics,
+        n_shaping=n_shaping,
+        n_transition=n_transition,
+        n_locking=n_locking,
+    )
+
+
 def detect_events(
     run_id: str,
     *,
@@ -132,6 +291,11 @@ def detect_events(
     composite_min_pairwise_overlap: int = 1,
     rank_threshold: float = 0.2,
     mass_threshold: float = 0.03,
+    # New parameters for local event windows
+    local_baseline_window: int | None = 20,  # ±N steps for local baseline (None = global)
+    local_baseline_fraction: float | None = 0.15,  # Alternative: ±15% of total steps
+    composite_stabilization_steps: int = 10,  # Delay composite detection until this many steps
+    min_event_separation: int = 5,  # Minimum steps between events of same type
 ) -> None:
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
@@ -195,6 +359,16 @@ def detect_events(
         "baseline_median",
         "baseline_mad",
 
+        # New: local vs global baseline fields
+        "local_baseline_median",
+        "local_baseline_mad",
+        "local_z_score",
+        "baseline_scope",  # "local" or "global"
+
+        # New: event phase classification
+        "event_phase",  # "shaping" (early), "locking" (late), or "transition"
+        "phase_progress",  # 0.0-1.0 indicating position in training
+
         "volatility_event",
         "volatility_baseline",
         "volatility_ratio",
@@ -212,6 +386,21 @@ def detect_events(
     if geom.empty:
         pd.DataFrame(columns=out_cols).to_parquet(out, index=False)
         return
+
+    # Compute total steps for local baseline window calculation
+    total_steps = int(geom["step"].max() - geom["step"].min()) if len(geom) > 1 else 1
+
+    # Determine local baseline window size
+    if local_baseline_fraction is not None:
+        local_window = max(5, int(total_steps * local_baseline_fraction))
+    elif local_baseline_window is not None:
+        local_window = local_baseline_window
+    else:
+        local_window = None  # Use global baseline
+
+    # Phase boundaries for event classification (default: early 30%, late 30%)
+    shaping_boundary = 0.30  # First 30% is "shaping" phase
+    locking_boundary = 0.70  # Last 30% is "locking" phase
 
     baselines = None
     volatility_baseline: dict[str, float] = {}
@@ -300,6 +489,28 @@ def detect_events(
             end_step = int(steps[e_idx + 1])
             step = end_step
 
+            # Compute phase progress and classification
+            step_min = int(geom["step"].min())
+            phase_progress = float((step - step_min) / max(1, total_steps))
+            if phase_progress < shaping_boundary:
+                event_phase = "shaping"
+            elif phase_progress > locking_boundary:
+                event_phase = "locking"
+            else:
+                event_phase = "transition"
+
+            # Compute local baseline if configured
+            local_med, local_mad, local_z = None, None, None
+            baseline_scope = "global"
+
+            center_idx = (s_idx + e_idx) // 2
+            if local_window is not None:
+                local_med, local_mad = _compute_local_baseline(
+                    deltas_abs, center_idx, local_window
+                )
+                local_z = float((metric_size - local_med) / local_mad)
+                baseline_scope = "local"
+
             breakdown = None
             baseline_med = None
             baseline_mad = None
@@ -320,6 +531,11 @@ def detect_events(
                 metric_z = float(breakdown.metric_z.get(metric_key, 0.0))
             else:
                 score = metric_size
+
+            # Use local z-score for final score if available and significant
+            if local_z is not None and local_window is not None:
+                # Blend: use local z-score as the primary score, global as context
+                score = max(score, abs(local_z) / 3.0)  # Scale local z to similar range
 
             events.append(
                 {
@@ -344,6 +560,12 @@ def detect_events(
                     "metric_z": metric_z,
                     "baseline_median": baseline_med,
                     "baseline_mad": baseline_mad,
+                    "local_baseline_median": local_med,
+                    "local_baseline_mad": local_mad,
+                    "local_z_score": local_z,
+                    "baseline_scope": baseline_scope,
+                    "event_phase": event_phase,
+                    "phase_progress": phase_progress,
                     "volatility_event": volatility_event,
                     "volatility_baseline": (float(vb) if vb is not None else None),
                     "volatility_ratio": (float(volatility_event / (float(vb) + 1e-8)) if vb is not None else None),
@@ -360,6 +582,13 @@ def detect_events(
             )
             event_id += 1
 
+    # Track single-metric event counts per layer for stabilization
+    single_metric_events_per_layer: dict[int, int] = {}
+    for ev in events:
+        layer = ev.get("layer")
+        if layer is not None and ev.get("event_type") == "change_point":
+            single_metric_events_per_layer[layer] = single_metric_events_per_layer.get(layer, 0) + 1
+
     for layer, metrics in sorted(layer_data.items()):
         all_windows: list[tuple[int, int]] = []
         for info in metrics.values():
@@ -368,6 +597,13 @@ def detect_events(
                 all_windows.extend(ws)
         if not all_windows:
             continue
+
+        # Filter windows: only consider those after stabilization period
+        # Stabilization means we need enough single-metric events first
+        min_single_events = max(2, composite_quorum_k)
+        if single_metric_events_per_layer.get(layer, 0) < min_single_events:
+            continue
+
         comp_windows = _merge_windows_with_gap(all_windows, gap=int(composite_merge_gap_steps))
 
         steps_ref = None
@@ -486,6 +722,20 @@ def detect_events(
                     continue
                 vr_map[mk] = float(ve / (vb + 1e-8))
 
+            # Compute phase for composite event
+            step_min = int(geom["step"].min())
+            comp_phase_progress = float((step - step_min) / max(1, total_steps))
+            if comp_phase_progress < shaping_boundary:
+                comp_event_phase = "shaping"
+            elif comp_phase_progress > locking_boundary:
+                comp_event_phase = "locking"
+            else:
+                comp_event_phase = "transition"
+
+            # Skip composite events that are too early (stabilization period)
+            if step < step_min + composite_stabilization_steps:
+                continue
+
             events.append(
                 {
                     "run_id": run_id,
@@ -509,6 +759,12 @@ def detect_events(
                     "metric_z": None,
                     "baseline_median": None,
                     "baseline_mad": None,
+                    "local_baseline_median": None,
+                    "local_baseline_mad": None,
+                    "local_z_score": None,
+                    "baseline_scope": "composite",
+                    "event_phase": comp_event_phase,
+                    "phase_progress": comp_phase_progress,
                     "volatility_event": None,
                     "volatility_baseline": None,
                     "volatility_ratio": None,

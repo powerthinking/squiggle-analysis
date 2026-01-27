@@ -23,7 +23,7 @@ import pandas as pd
 from squiggle_core import paths
 
 from .metrics.event_diversity import EventDiversityMetrics, compute_event_diversity
-from .trajectories import extract_metric_trajectories
+from .trajectories import extract_metric_trajectories, compare_run_trajectories
 
 
 @dataclass
@@ -248,6 +248,87 @@ def compute_trajectory_correlation(
     return pd.DataFrame(correlations, index=run_ids, columns=run_ids)
 
 
+def analyze_event_phases(run: RunData) -> Dict[str, any]:
+    """
+    Analyze event distribution across training phases.
+
+    Phases:
+    - warmup: 0 to warmup_end
+    - high_lr: warmup_end to decay (for constant LR, this is entire training)
+    - decay: decay_start to floor_start (for cosine)
+    - floor: floor_start to end
+
+    Returns dict with:
+    - phase_counts: events per phase
+    - boundary_events: events within 5 steps of phase boundaries
+    - schedule_artifact_warning: True if most events at boundaries
+    """
+    meta = run.meta
+    events_df = run.events_df
+
+    # Get phase boundaries from meta (if available)
+    phase_boundaries = meta.get("phase_boundaries", {})
+    warmup_end = phase_boundaries.get("warmup_end", 0)
+    decay_start = phase_boundaries.get("decay_start", 0)
+    floor_start = phase_boundaries.get("floor_start", meta.get("steps", 10000))
+    total_steps = phase_boundaries.get("total_steps", meta.get("steps", 10000))
+
+    # Also check for epoch boundaries
+    steps_per_epoch = meta.get("steps_per_epoch", 0)
+    epochs = meta.get("epochs", 1)
+
+    # Classify events into phases
+    def get_phase(step: int) -> str:
+        if step < warmup_end:
+            return "warmup"
+        elif step < floor_start:
+            return "high_lr"
+        else:
+            return "floor"
+
+    if events_df.empty:
+        return {
+            "phase_counts": {"warmup": 0, "high_lr": 0, "floor": 0},
+            "boundary_events": 0,
+            "schedule_artifact_warning": False,
+            "phase_boundaries": phase_boundaries,
+        }
+
+    # Count events per phase
+    events_df = events_df.copy()
+    events_df["phase"] = events_df["step"].apply(get_phase)
+    phase_counts = events_df["phase"].value_counts().to_dict()
+
+    # Check for boundary events (within 5 steps of any boundary)
+    boundary_tolerance = 5
+    boundaries = [warmup_end, floor_start]
+    if steps_per_epoch > 0:
+        # Add epoch boundaries
+        for e in range(1, epochs + 1):
+            boundaries.append(e * steps_per_epoch)
+
+    boundary_events = 0
+    for _, event in events_df.iterrows():
+        step = event["step"]
+        for boundary in boundaries:
+            if abs(step - boundary) <= boundary_tolerance:
+                boundary_events += 1
+                break
+
+    # Warning if >50% of events are at boundaries
+    total_events = len(events_df)
+    schedule_artifact_warning = (boundary_events / max(1, total_events)) > 0.5
+
+    return {
+        "phase_counts": phase_counts,
+        "boundary_events": boundary_events,
+        "total_events": total_events,
+        "boundary_fraction": boundary_events / max(1, total_events),
+        "schedule_artifact_warning": schedule_artifact_warning,
+        "phase_boundaries": phase_boundaries,
+    }
+
+
 def _extract_seed_from_run_id(run_id: str, meta: Dict) -> str:
     """Extract seed from run_id or metadata."""
     # Try metadata first
@@ -288,6 +369,9 @@ def generate_comparison_report(
     run_ids: List[str],
     output_path: Optional[Path] = None,
     step_tolerance: int = 5,
+    generate_plots: bool = True,
+    plots_dir: Optional[Path] = None,
+    layers: List[int] = [0, 12, 23],
 ) -> str:
     """
     Generate a markdown comparison report for multiple runs.
@@ -296,6 +380,9 @@ def generate_comparison_report(
         run_ids: List of run IDs to compare
         output_path: If provided, write report to this file
         step_tolerance: Step tolerance for common event detection
+        generate_plots: Whether to generate trajectory plots
+        plots_dir: Directory for plots (default: same dir as output_path or cwd)
+        layers: Layers to include in trajectory plots
 
     Returns:
         Markdown report string
@@ -307,7 +394,34 @@ def generate_comparison_report(
     common_events = find_common_events(runs, step_tolerance=step_tolerance)
 
     # Compute trajectory correlation
-    corr_matrix = compute_trajectory_correlation(runs)
+    corr_matrix = compute_trajectory_correlation(runs, layers=layers)
+
+    # Generate trajectory plots
+    plot_paths: Dict[str, Path] = {}
+    if generate_plots:
+        if plots_dir is None:
+            if output_path:
+                plots_dir = Path(output_path).parent / "plots"
+            else:
+                plots_dir = Path.cwd() / "comparison_plots"
+
+        plots_dir = Path(plots_dir)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build geometry dict for compare_run_trajectories
+        run_geometry_dfs = {run.run_id: run.geometry_df for run in runs}
+
+        for metric in ["effective_rank", "sv_entropy"]:
+            compare_run_trajectories(
+                run_geometry_dfs,
+                layers=layers,
+                metric=metric,
+                output_dir=plots_dir,
+            )
+            # Track plot paths
+            for layer in layers:
+                plot_key = f"{metric}_layer_{layer}"
+                plot_paths[plot_key] = plots_dir / f"{metric}_layer_{layer}_comparison.png"
 
     # Build report
     lines = []
@@ -395,6 +509,34 @@ def generate_comparison_report(
 
     lines.append("")
 
+    # Trajectory Plots Section
+    if generate_plots and plot_paths:
+        lines.append("## Trajectory Plots")
+        lines.append("")
+        lines.append("Overlay plots showing metric trajectories across all runs.")
+        lines.append("")
+
+        for metric in ["effective_rank", "sv_entropy"]:
+            lines.append(f"### {metric.replace('_', ' ').title()}")
+            lines.append("")
+            for layer in layers:
+                plot_key = f"{metric}_layer_{layer}"
+                if plot_key in plot_paths:
+                    plot_file = plot_paths[plot_key]
+                    # Use relative path if output_path is set
+                    if output_path:
+                        try:
+                            rel_path = plot_file.relative_to(Path(output_path).parent)
+                        except ValueError:
+                            rel_path = plot_file
+                    else:
+                        rel_path = plot_file
+                    lines.append(f"**Layer {layer}:**")
+                    lines.append(f"![{metric} Layer {layer}]({rel_path})")
+                    lines.append("")
+
+    lines.append("")
+
     # Diversity Comparison Section
     lines.append("## Diversity Comparison")
     lines.append("")
@@ -411,6 +553,41 @@ def generate_comparison_report(
         lines.append("Consistent diversity scores across runs.")
     else:
         lines.append("Note: High variance in diversity scores - runs may have different event patterns.")
+
+    lines.append("")
+
+    # Phase Analysis Section
+    lines.append("## Event Phase Analysis")
+    lines.append("")
+    lines.append("Events classified by training phase (warmup, high_lr, floor).")
+    lines.append("")
+
+    phase_analyses = [analyze_event_phases(run) for run in runs]
+    any_schedule_warning = any(pa["schedule_artifact_warning"] for pa in phase_analyses)
+
+    # Build phase table
+    lines.append("| Run | Warmup | High LR | Floor | Boundary Events | Warning |")
+    lines.append("|-----|--------|---------|-------|-----------------|---------|")
+
+    for run, pa in zip(runs, phase_analyses):
+        short_id = run.run_id[:15] + "..." if len(run.run_id) > 18 else run.run_id
+        warmup_count = pa["phase_counts"].get("warmup", 0)
+        high_lr_count = pa["phase_counts"].get("high_lr", 0)
+        floor_count = pa["phase_counts"].get("floor", 0)
+        boundary_pct = pa["boundary_fraction"] * 100
+        warning = "Yes" if pa["schedule_artifact_warning"] else "-"
+        lines.append(f"| {short_id} | {warmup_count} | {high_lr_count} | {floor_count} | {boundary_pct:.0f}% | {warning} |")
+
+    lines.append("")
+
+    if any_schedule_warning:
+        lines.append("**Warning:** >50% of events are at phase boundaries - likely schedule artifacts.")
+        lines.append("")
+        lines.append("Consider:")
+        lines.append("- Running with constant LR to isolate data-driven events")
+        lines.append("- Filtering events near warmup_end and LR floor transitions")
+    else:
+        lines.append("Events are distributed across phases - good evidence of data-driven dynamics.")
 
     lines.append("")
 
@@ -483,6 +660,24 @@ def main():
         default=5,
         help="Step tolerance for matching events (default: 5)",
     )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip trajectory plot generation",
+    )
+    parser.add_argument(
+        "--plots-dir",
+        type=Path,
+        default=None,
+        help="Directory for trajectory plots (default: plots/ next to output)",
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=[0, 12, 23],
+        help="Layers to include in trajectory plots (default: 0 12 23)",
+    )
 
     args = parser.parse_args()
 
@@ -493,6 +688,9 @@ def main():
         args.run_ids,
         output_path=args.output,
         step_tolerance=args.step_tolerance,
+        generate_plots=not args.no_plots,
+        plots_dir=args.plots_dir,
+        layers=args.layers,
     )
 
     if args.output is None:

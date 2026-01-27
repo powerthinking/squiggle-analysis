@@ -44,6 +44,23 @@ def main():
         default=5,
         help="Step tolerance for matching events in comparison (default: 5)",
     )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip trajectory plot generation in comparison mode",
+    )
+    parser.add_argument(
+        "--plots-dir",
+        type=Path,
+        help="Directory for trajectory plots (default: plots/ next to output)",
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=[0, 12, 23],
+        help="Layers for trajectory plots (default: 0 12 23)",
+    )
 
     args = parser.parse_args()
 
@@ -58,6 +75,9 @@ def main():
             run_ids=args.compare,
             output_path=args.output,
             step_tolerance=args.step_tolerance,
+            generate_plots=not args.no_plots,
+            plots_dir=args.plots_dir,
+            layers=args.layers,
         )
 
         if args.output is None:
