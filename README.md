@@ -48,7 +48,29 @@ Supported event types:
 
 Events are written to:
 
-- `events_candidates/<run_id>.parquet` 
+- `events_candidates/<run_id>.parquet`
+
+### Adaptive Thresholding
+
+By default, event detection uses **adaptive thresholds** computed per (layer, metric) as:
+
+```
+threshold = median(deltas) + k × MAD(deltas)
+```
+
+Where MAD is the Median Absolute Deviation. This identifies statistically unusual changes relative to each metric's own distribution, rather than using fixed thresholds that may not scale across different models.
+
+Parameters (in `detect_events()`):
+- `adaptive_threshold: bool = True` — Enable adaptive thresholding (default: on)
+- `adaptive_k: float = 2.5` — Multiplier for MAD (higher = fewer events)
+- `adaptive_min_threshold: float = 0.01` — Floor to prevent too-low thresholds
+
+To use fixed thresholds instead (legacy behavior):
+```python
+detect_events(run_id, adaptive_threshold=False, rank_threshold=0.2, mass_threshold=0.03)
+```
+
+### Baseline Usage
 
 Optional baseline usage:
 - score against a designated baseline run (`baseline_run_id`) or a persisted baseline artifact (`baseline_id`)

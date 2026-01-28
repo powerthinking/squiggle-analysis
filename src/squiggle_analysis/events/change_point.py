@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import math
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
 from squiggle_core import paths
 from squiggle_core.scoring.baselines import (
     build_metric_baselines_from_run,
-    load_baseline,
     load_baseline_with_volatility,
 )
 from squiggle_core.scoring.squiggle_scoring import (
     ScoringConfig,
     build_baselines_from_samples,
     compute_event_score,
- )
+)
 
 
 def _merge_overlapping_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -128,6 +127,34 @@ def _mad(xs: list[float]) -> float:
     med = _median(xs)
     devs = [abs(x - med) for x in xs]
     return _median(devs)
+
+
+def _compute_adaptive_threshold(
+    deltas: list[float],
+    k: float = 2.5,
+    min_threshold: float = 0.01,
+) -> float:
+    """Compute adaptive threshold as median + k * MAD.
+
+    This identifies statistically unusual changes relative to the data's own
+    distribution, rather than using fixed thresholds that may not scale
+    across different models or metrics.
+
+    Args:
+        deltas: List of absolute delta values
+        k: Multiplier for MAD (higher = less sensitive, fewer events)
+        min_threshold: Floor value to prevent too-low thresholds
+
+    Returns:
+        Adaptive threshold value
+    """
+    if not deltas:
+        return min_threshold
+    med = _median(deltas)
+    mad = _mad(deltas)
+    # Use k * MAD, but ensure we have a reasonable floor
+    threshold = med + k * mad
+    return max(threshold, min_threshold)
 
 
 def _compute_local_baseline(
@@ -277,6 +304,42 @@ def compute_event_entropy(events_df: pd.DataFrame, total_steps: int, n_layers: i
     )
 
 
+def _select_top_k_peaks(
+    hit_idxs: list[int],
+    deltas: list[float],
+    max_peaks: int,
+    suppression_radius: int,
+) -> list[int]:
+    """Select top-K peaks with non-maximum suppression.
+
+    Args:
+        hit_idxs: Indices where deltas exceed threshold
+        deltas: All delta values
+        max_peaks: Maximum number of peaks to return
+        suppression_radius: Minimum index separation between peaks
+
+    Returns:
+        List of selected peak indices, sorted by position
+    """
+    if not hit_idxs:
+        return []
+
+    # Sort hits by delta magnitude (descending)
+    sorted_hits = sorted(hit_idxs, key=lambda i: deltas[i], reverse=True)
+
+    selected: list[int] = []
+    for idx in sorted_hits:
+        if len(selected) >= max_peaks:
+            break
+        # Check if this peak is far enough from already selected peaks
+        too_close = any(abs(idx - s) < suppression_radius for s in selected)
+        if not too_close:
+            selected.append(idx)
+
+    # Return sorted by position (chronological order)
+    return sorted(selected)
+
+
 def detect_events(
     run_id: str,
     *,
@@ -291,11 +354,19 @@ def detect_events(
     composite_min_pairwise_overlap: int = 1,
     rank_threshold: float = 0.2,
     mass_threshold: float = 0.03,
+    # Adaptive threshold parameters
+    adaptive_threshold: bool = True,  # Use median + k*MAD instead of fixed thresholds
+    adaptive_k: float = 2.5,  # Multiplier for MAD (higher = fewer events)
+    adaptive_min_threshold: float = 0.01,  # Floor to prevent too-low thresholds
     # New parameters for local event windows
     local_baseline_window: int | None = 20,  # ±N steps for local baseline (None = global)
     local_baseline_fraction: float | None = 0.15,  # Alternative: ±15% of total steps
     composite_stabilization_steps: int = 10,  # Delay composite detection until this many steps
     min_event_separation: int = 5,  # Minimum steps between events of same type
+    # Peak selection parameters (new)
+    max_events_per_series: int = 5,  # Target 2-5 events per (layer, metric)
+    peak_suppression_radius: int = 3,  # Minimum index separation between peaks
+    event_window_radius: int = 1,  # Window around each peak for start_step/end_step
 ) -> Optional[EventEntropyMetrics]:
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
@@ -454,22 +525,29 @@ def detect_events(
         if len(values) < 2:
             continue
 
-        thr = _threshold_for_metric(str(metric))
-
         deltas_abs = [float(abs(values[i] - values[i - 1])) for i in range(1, len(values))]
         if not deltas_abs:
             continue
+
+        # Compute threshold: adaptive (median + k*MAD) or fixed
+        if adaptive_threshold:
+            thr = _compute_adaptive_threshold(
+                deltas_abs, k=adaptive_k, min_threshold=adaptive_min_threshold
+            )
+        else:
+            thr = _threshold_for_metric(str(metric))
 
         hit_idxs = [i for i, d in enumerate(deltas_abs) if d > thr]
         if not hit_idxs:
             continue
 
+        # Build windows for composite event detection (still merged)
         raw_windows: list[tuple[int, int]] = []
         for idx in hit_idxs:
             s = max(0, idx - int(window_radius_steps))
             e = min(len(deltas_abs) - 1, idx + int(window_radius_steps))
             raw_windows.append((s, e))
-        windows = _merge_overlapping_windows(raw_windows)
+        merged_windows = _merge_overlapping_windows(raw_windows)
 
         metric_key = str(metric)
         vb = volatility_baseline.get(metric_key)
@@ -478,16 +556,37 @@ def detect_events(
         ld[metric_key] = {
             "steps": steps,
             "deltas_abs": deltas_abs,
-            "windows": windows,
+            "windows": merged_windows,  # Keep merged for composite detection
         }
 
-        for s_idx, e_idx in windows:
-            metric_size = float(max(deltas_abs[s_idx : e_idx + 1]))
-            volatility_event = float(_median(deltas_abs[s_idx : e_idx + 1]))
+        # Select top-K peaks with suppression (target 2-5 events per series)
+        selected_peaks = _select_top_k_peaks(
+            hit_idxs=hit_idxs,
+            deltas=deltas_abs,
+            max_peaks=max_events_per_series,
+            suppression_radius=peak_suppression_radius,
+        )
 
-            start_step = int(steps[s_idx])
-            end_step = int(steps[e_idx + 1])
-            step = end_step
+        # Create events for each selected peak with local window
+        for peak_idx in selected_peaks:
+            # The delta at peak_idx is between steps[peak_idx] and steps[peak_idx+1]
+            metric_size = float(deltas_abs[peak_idx])
+
+            # Context window for volatility calculation
+            ctx_start = max(0, peak_idx - int(window_radius_steps))
+            ctx_end = min(len(deltas_abs) - 1, peak_idx + int(window_radius_steps))
+            context_deltas = deltas_abs[ctx_start : ctx_end + 1]
+            volatility_event = float(_median(context_deltas))
+
+            # Event location and context window
+            # start_step = step before the change (where the delta starts)
+            # step = step after the change (canonical event time)
+            # end_step = window end for context
+            win_end_idx = min(len(steps) - 1, peak_idx + 1 + event_window_radius)
+
+            start_step = int(steps[peak_idx])  # Step before the change
+            step = int(steps[min(peak_idx + 1, len(steps) - 1)])  # Step after the change
+            end_step = int(steps[win_end_idx])  # Context window end
 
             # Compute phase progress and classification
             step_min = int(geom["step"].min())
@@ -503,10 +602,9 @@ def detect_events(
             local_med, local_mad, local_z = None, None, None
             baseline_scope = "global"
 
-            center_idx = (s_idx + e_idx) // 2
             if local_window is not None:
                 local_med, local_mad = _compute_local_baseline(
-                    deltas_abs, center_idx, local_window
+                    deltas_abs, peak_idx, local_window
                 )
                 local_z = float((metric_size - local_med) / local_mad)
                 baseline_scope = "local"
@@ -679,9 +777,26 @@ def detect_events(
             if len(metric_sizes_all) < k_req:
                 continue
 
+            # Find the peak across all metrics in this composite window
+            # Use the position of the largest change as the canonical event location
+            peak_idx = s_idx
+            max_delta = 0.0
+            for metric_key in component:
+                info = metrics.get(metric_key)
+                if info is None:
+                    continue
+                deltas_abs = info.get("deltas_abs")
+                if not isinstance(deltas_abs, list) or not deltas_abs:
+                    continue
+                for i in range(s_idx, min(e_idx + 1, len(deltas_abs))):
+                    if deltas_abs[i] > max_delta:
+                        max_delta = deltas_abs[i]
+                        peak_idx = i
+
+            # step = peak location, start_step/end_step = window boundaries for context
+            step = int(steps_ref[min(peak_idx + 1, len(steps_ref) - 1)])
             start_step = int(steps_ref[s_idx])
-            end_step = int(steps_ref[e_idx + 1])
-            step = end_step
+            end_step = int(steps_ref[min(e_idx + 1, len(steps_ref) - 1)])
 
             baselines_scored: dict[str, object] = {}
             metric_sizes_scored: dict[str, float] = {}

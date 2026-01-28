@@ -199,9 +199,30 @@ def write_report(
 
     # ---- Events table (interval-aware) ----
     events_section = ""
+    events_summary_lines: list[str] = []
     if events is None or events.empty:
         events_section = "_No events detected (or events file missing)._"
     else:
+        # Compute summary statistics
+        single_events = events[events["event_type"] == "change_point"] if "event_type" in events.columns else events
+        composite_events = events[events["event_type"] == "change_point_composite"] if "event_type" in events.columns else pd.DataFrame()
+
+        events_summary_lines.append(f"- total events: **{len(events)}** ({len(single_events)} single-metric, {len(composite_events)} composite)")
+
+        if not single_events.empty and "layer" in single_events.columns and "metric" in single_events.columns:
+            events_per_series = single_events.groupby(["layer", "metric"]).size()
+            events_summary_lines.append(
+                f"- events per (layer, metric): min={events_per_series.min()}, max={events_per_series.max()}, mean={events_per_series.mean():.1f}"
+            )
+
+        if "start_step" in events.columns:
+            zero_start = (events["start_step"] == 0).sum()
+            events_summary_lines.append(f"- events with start_step=0: {zero_start}/{len(events)} ({100*zero_start/len(events):.1f}%)")
+
+        events_summary_lines.append("")
+        events_summary_lines.append("_Detection: adaptive threshold (median + 2.5×MAD), top-5 peaks per series, suppression radius=3_")
+        events_summary_lines.append("")
+
         # Choose the most informative columns available.
         preferred_cols = [
             "run_id",
@@ -287,6 +308,7 @@ def write_report(
 
     lines.append("")
     lines.append("## Events")
+    lines.extend(events_summary_lines)
     lines.append(events_section)
     lines.append("")
     lines.append(f"- events_candidates: `{events_candidates_path}`")
