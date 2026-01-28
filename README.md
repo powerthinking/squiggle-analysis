@@ -1,22 +1,16 @@
-# squiggle-analysis — **Geometry, events, reports**
-
-### `squiggle-analysis/README.md`
-
-```md
 # squiggle-analysis
 
 Post-training analysis pipeline for Squiggle runs.
 
-This repo consumes artifacts written by `squiggle-experiments`
-and produces interpretable summaries of model behavior.
+This package consumes artifacts written by `squiggle-experiments` and produces interpretable summaries of model behavior.
 
 ## Pipeline Overview
 
 For a given `run_id`, analysis proceeds in order:
 
-1. **Geometry computation**
-2. **Event detection**
-3. **Report generation**
+1. **Geometry computation** — Extract basis-invariant descriptors from captures
+2. **Event detection** — Identify significant geometric changes over time
+3. **Report generation** — Produce human-readable summaries
 
 Each step writes a stable artifact and can be re-run independently.
 
@@ -26,55 +20,62 @@ Geometry is computed from captured activations and written to:
 
 - `geometry_state/<run_id>.parquet`
 
-Current metrics include:
-- `effective_rank`
-- `topk_mass_k8`
+Current metrics:
+- `effective_rank` — Dimensionality utilization
+- `sv_entropy` — Singular value distribution entropy
+- `topk_mass_k8` — Mass concentration in top-k singular values
 
 The geometry state is treated as *ground truth* for downstream analysis.
 
-## Events
+## Event Detection
 
-Events detect significant geometric change over time.
-
-- Interval-based (`start_step`, `end_step`)
-- Metric-aware thresholds
-- Layer-specific
-
-Event candidates are scored using the shared scoring implementation in `squiggle_core.scoring`.
-
-Supported event types:
-- `change_point` (single metric)
-- `change_point_composite` (multi-metric; `metric = __composite__`)
-
-Events are written to:
-
-- `events_candidates/<run_id>.parquet`
+Events identify statistically unusual geometric changes. Key features:
 
 ### Adaptive Thresholding
 
-By default, event detection uses **adaptive thresholds** computed per (layer, metric) as:
+Thresholds computed per (layer, metric) series:
 
 ```
 threshold = median(deltas) + k × MAD(deltas)
 ```
 
-Where MAD is the Median Absolute Deviation. This identifies statistically unusual changes relative to each metric's own distribution, rather than using fixed thresholds that may not scale across different models.
+This identifies unusual changes relative to each metric's own distribution.
 
-Parameters (in `detect_events()`):
-- `adaptive_threshold: bool = True` — Enable adaptive thresholding (default: on)
-- `adaptive_k: float = 2.5` — Multiplier for MAD (higher = fewer events)
-- `adaptive_min_threshold: float = 0.01` — Floor to prevent too-low thresholds
+### Peak Selection with Suppression
 
-To use fixed thresholds instead (legacy behavior):
-```python
-detect_events(run_id, adaptive_threshold=False, rank_threshold=0.2, mass_threshold=0.03)
+Non-maximum suppression prevents detecting the same transition multiple times:
+
+- Sort candidates by magnitude
+- Select top candidate
+- Suppress nearby candidates within `suppression_radius` steps
+- Repeat until budget exhausted
+
+### Warmup-Aware Budgeting
+
+Separate budgets for pre-warmup and post-warmup candidates:
+
+```
+max_peaks_post = max_events_per_series - max_pre_warmup
+max_peaks_pre = max_pre_warmup
 ```
 
-### Baseline Usage
+This prevents early training transients from consuming the event budget.
 
-Optional baseline usage:
-- score against a designated baseline run (`baseline_run_id`) or a persisted baseline artifact (`baseline_id`)
+### Detection Summary
 
+Retention statistics written to `detection_summary/<run_id>.parquet`:
+- Raw candidates per series
+- Selected vs skipped counts
+- Skip reasons (suppression, budget, warmup cap)
+- Pre/post warmup breakdown
+
+Events are written to:
+
+- `events_candidates/<run_id>.parquet`
+
+Supported event types:
+- `change_point` (single metric)
+- `change_point_composite` (multi-metric; `metric = __composite__`)
 
 ## Reporting
 
@@ -82,25 +83,48 @@ Each run produces a human-readable report:
 
 - `runs/<run_id>/reports/report.md`
 
-
 The report summarizes:
 - Training scalars
-- Probe performance
 - Capture inventory
 - Geometry metrics
 - Top detected events
-
-Reports are intended to be:
-- Shareable
-- Diffable
-- Durable
+- Detection retention analysis
+- Event distribution diagnostics
 
 ## CLI
 
 Run full analysis:
 
+```bash
 python -m squiggle_analysis --run-id <RUN_ID>
-
+```
 
 Force recompute:
+
+```bash
 python -m squiggle_analysis --run-id <RUN_ID> --force
+```
+
+Event detection options:
+
+```bash
+python -m squiggle_analysis --run-id <RUN_ID> \
+    --adaptive-k 2.5 \
+    --suppression-radius 15 \
+    --warmup-fraction 0.1 \
+    --max-pre-warmup 1
+```
+
+## Cross-Run Comparison
+
+Compare multiple runs for seed invariance:
+
+```bash
+python -m squiggle_analysis.compare_runs RUN_ID1 RUN_ID2 RUN_ID3 --output comparison.md
+```
+
+The comparison includes:
+- Common events across runs
+- Trajectory correlation
+- Retention metrics comparison
+- Phase distribution analysis

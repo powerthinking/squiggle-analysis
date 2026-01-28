@@ -931,11 +931,8 @@ def format_retention_summary_md(summary: pd.DataFrame | None) -> str:
     # Overall stats (single-metric events only; composites are derived separately)
     avg_retention = summary["retention_ratio"].mean()
     avg_suppression_skip = summary["suppression_skip_ratio"].mean()
-    avg_topk_skip = summary["topk_skip_ratio"].mean()
     total_candidates = int(summary["n_candidates_raw"].sum())
     total_selected = int(summary["n_selected_final"].sum())
-    total_skipped_supp = int(summary["n_skipped_suppression"].sum())
-    total_skipped_topk = int(summary["n_skipped_topk"].sum())
 
     lines.append(f"**Overall (single-metric):** {total_selected}/{total_candidates} candidates "
                  f"retained ({avg_retention:.0%} retention)")

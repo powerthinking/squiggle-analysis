@@ -27,6 +27,57 @@ from .trajectories import extract_metric_trajectories, compare_run_trajectories
 
 
 @dataclass
+class DetectionConfig:
+    """Detection parameters extracted from detection_summary."""
+
+    adaptive_k: Optional[float] = None
+    suppression_radius: Optional[int] = None
+    max_peaks: Optional[int] = None
+    warmup_end_step: Optional[int] = None
+    max_pre_warmup: Optional[int] = None
+
+    def fingerprint(self) -> str:
+        """Short fingerprint string for display."""
+        parts = []
+        if self.adaptive_k is not None:
+            parts.append(f"k={self.adaptive_k}")
+        if self.suppression_radius is not None:
+            parts.append(f"supp={self.suppression_radius}")
+        if self.max_peaks is not None:
+            parts.append(f"max={self.max_peaks}")
+        if self.warmup_end_step is not None:
+            parts.append(f"warmup={self.warmup_end_step}")
+        if self.max_pre_warmup is not None:
+            parts.append(f"pre={self.max_pre_warmup}")
+        return ", ".join(parts) if parts else "unknown"
+
+    def config_hash(self) -> str:
+        """Short hash of config for quick comparison."""
+        import hashlib
+        s = f"{self.adaptive_k}:{self.suppression_radius}:{self.max_peaks}:{self.warmup_end_step}:{self.max_pre_warmup}"
+        return hashlib.md5(s.encode()).hexdigest()[:8]
+
+
+@dataclass
+class RetentionMetrics:
+    """Retention metrics from detection summary."""
+
+    n_candidates: int = 0
+    n_selected: int = 0
+    retention_rate: float = 0.0
+    pre_retention_rate: float = 0.0
+    post_retention_rate: float = 0.0
+    suppression_rate: float = 0.0
+    suppression_pre: int = 0
+    suppression_post: int = 0
+    topk_post: int = 0
+    pre_warmup_cap: int = 0
+    # Per-series density metrics
+    mean_candidates_per_series: float = 0.0
+    mean_candidates_post_per_series: float = 0.0
+
+
+@dataclass
 class RunData:
     """Container for all analysis data from a single run."""
 
@@ -36,6 +87,8 @@ class RunData:
     scalars_df: Optional[pd.DataFrame]
     meta: Dict
     diversity: EventDiversityMetrics
+    retention: Optional[RetentionMetrics] = None
+    detection_config: Optional[DetectionConfig] = None
 
 
 def load_run_data(run_id: str) -> RunData:
@@ -76,6 +129,54 @@ def load_run_data(run_id: str) -> RunData:
     # Compute diversity metrics
     diversity = compute_event_diversity(events_df)
 
+    # Load detection summary (retention metrics + detection config) if available
+    retention = None
+    detection_config = None
+    detection_summary_path = paths.detection_summary_path(run_id)
+    if detection_summary_path.exists():
+        ds = pd.read_parquet(detection_summary_path)
+        n_series = len(ds)
+        n_candidates = int(ds["n_candidates_raw"].sum())
+        n_selected = int(ds["n_selected_final"].sum())
+
+        # Pre/post breakdown
+        n_pre = int(ds["n_candidates_pre"].sum())
+        n_post = int(ds["n_candidates_post"].sum())
+        sel_pre = int(ds["n_selected_pre"].sum())
+        sel_post = int(ds["n_selected_post"].sum())
+
+        # Skip breakdowns
+        supp_pre = int(ds.get("n_skipped_suppression_pre", pd.Series([0])).sum())
+        supp_post = int(ds.get("n_skipped_suppression_post", pd.Series([0])).sum())
+        topk_post = int(ds.get("n_skipped_topk_post", pd.Series([0])).sum())
+        pre_cap = int(ds["n_skipped_pre_warmup_cap"].sum())
+
+        retention = RetentionMetrics(
+            n_candidates=n_candidates,
+            n_selected=n_selected,
+            retention_rate=n_selected / max(n_candidates, 1),
+            pre_retention_rate=sel_pre / max(n_pre, 1),
+            post_retention_rate=sel_post / max(n_post, 1),
+            suppression_rate=(supp_pre + supp_post) / max(n_candidates, 1),
+            suppression_pre=supp_pre,
+            suppression_post=supp_post,
+            topk_post=topk_post,
+            pre_warmup_cap=pre_cap,
+            mean_candidates_per_series=n_candidates / max(n_series, 1),
+            mean_candidates_post_per_series=n_post / max(n_series, 1),
+        )
+
+        # Extract detection config from first row (should be same across all series)
+        if not ds.empty:
+            first_row = ds.iloc[0]
+            detection_config = DetectionConfig(
+                adaptive_k=float(first_row.get("adaptive_k")) if "adaptive_k" in ds.columns else None,
+                suppression_radius=int(first_row.get("suppression_radius_steps")) if "suppression_radius_steps" in ds.columns else None,
+                max_peaks=int(first_row.get("max_peaks")) if "max_peaks" in ds.columns else None,
+                warmup_end_step=int(first_row.get("warmup_end_step")) if "warmup_end_step" in ds.columns and pd.notna(first_row.get("warmup_end_step")) else None,
+                max_pre_warmup=int(first_row.get("max_pre_warmup")) if "max_pre_warmup" in ds.columns and pd.notna(first_row.get("max_pre_warmup")) else None,
+            )
+
     return RunData(
         run_id=run_id,
         geometry_df=geometry_df,
@@ -83,6 +184,8 @@ def load_run_data(run_id: str) -> RunData:
         scalars_df=scalars_df,
         meta=meta,
         diversity=diversity,
+        retention=retention,
+        detection_config=detection_config,
     )
 
 
@@ -180,6 +283,159 @@ def find_common_events(
             })
 
     return pd.DataFrame(results)
+
+
+def _event_key(row: pd.Series, step_bucket: int = 10) -> tuple:
+    """Create a bucketed event key for set operations."""
+    step_bucketed = (int(row["step"]) // step_bucket) * step_bucket
+    return (int(row["layer"]), row["metric"], row["event_type"], step_bucketed)
+
+
+def compute_event_jaccard(
+    runs: List[RunData],
+    step_bucket: int = 10,
+) -> Dict[str, any]:
+    """
+    Compute Jaccard similarity and precision/recall between runs.
+
+    Args:
+        runs: List of RunData objects (must be exactly 2 for pairwise)
+        step_bucket: Step bucketing for key comparison
+
+    Returns:
+        Dict with jaccard, precision_ab, recall_ab, precision_ba, recall_ba
+    """
+    if len(runs) != 2:
+        return {}
+
+    run_a, run_b = runs
+
+    # Create event key sets
+    keys_a = set(_event_key(row, step_bucket) for _, row in run_a.events_df.iterrows())
+    keys_b = set(_event_key(row, step_bucket) for _, row in run_b.events_df.iterrows())
+
+    intersection = keys_a & keys_b
+    union = keys_a | keys_b
+
+    jaccard = len(intersection) / max(len(union), 1)
+    precision_ab = len(intersection) / max(len(keys_a), 1)  # common / A
+    recall_ab = len(intersection) / max(len(keys_b), 1)     # common / B
+
+    return {
+        "jaccard": jaccard,
+        "intersection": len(intersection),
+        "union": len(union),
+        "events_a": len(keys_a),
+        "events_b": len(keys_b),
+        "precision_ab": precision_ab,  # What fraction of A's events appear in B
+        "recall_ab": recall_ab,         # What fraction of B's events appear in A
+    }
+
+
+def generate_event_raster_plot(
+    runs: List[RunData],
+    output_dir: Path,
+    max_layer: int = 24,
+) -> Dict[str, Path]:
+    """
+    Generate event raster plots (step x layer, colored by metric).
+
+    Args:
+        runs: List of RunData objects
+        output_dir: Directory to save plots
+        max_layer: Maximum layer index for y-axis
+
+    Returns:
+        Dict mapping plot names to paths
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+    except ImportError:
+        return {}
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_paths = {}
+
+    # Color map for metrics
+    metric_colors = {
+        "effective_rank": "blue",
+        "sv_entropy": "green",
+        "topk_mass_k8": "orange",
+        "__composite__": "red",
+    }
+
+    for run in runs:
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        events = run.events_df
+        if events.empty:
+            continue
+
+        # Filter out composites for cleaner visualization (or include with different marker)
+        single_events = events[events["metric"] != "__composite__"]
+
+        for metric, color in metric_colors.items():
+            metric_events = single_events[single_events["metric"] == metric]
+            if not metric_events.empty:
+                ax.scatter(
+                    metric_events["step"],
+                    metric_events["layer"],
+                    c=color,
+                    s=30,
+                    alpha=0.7,
+                    label=metric,
+                )
+
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Layer")
+        ax.set_ylim(-0.5, max_layer - 0.5)
+        ax.set_title(f"Event Raster: {run.run_id[:30]}...")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # Short filename
+        short_id = run.run_id.split("_")[-1] if "_" in run.run_id else run.run_id[:10]
+        plot_path = output_dir / f"raster_{short_id}.png"
+        fig.savefig(plot_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths[f"raster_{short_id}"] = plot_path
+
+    # Generate intersection raster (if 2 runs)
+    if len(runs) == 2:
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        run_a, run_b = runs
+        keys_a = {_event_key(row, 10): row for _, row in run_a.events_df.iterrows()}
+        keys_b = {_event_key(row, 10): row for _, row in run_b.events_df.iterrows()}
+
+        common_keys = set(keys_a.keys()) & set(keys_b.keys())
+
+        if common_keys:
+            common_events = [keys_a[k] for k in common_keys]
+            steps = [e["step"] for e in common_events]
+            layers = [e["layer"] for e in common_events]
+            colors = [metric_colors.get(e["metric"], "gray") for e in common_events]
+
+            ax.scatter(steps, layers, c=colors, s=50, alpha=0.8)
+
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Layer")
+        ax.set_ylim(-0.5, max_layer - 0.5)
+        ax.set_title(f"Common Events ({len(common_keys)} events)")
+        ax.grid(True, alpha=0.3)
+
+        # Legend
+        patches = [mpatches.Patch(color=c, label=m) for m, c in metric_colors.items() if m != "__composite__"]
+        ax.legend(handles=patches, loc="upper right", fontsize=8)
+
+        plot_path = output_dir / "raster_intersection.png"
+        fig.savefig(plot_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths["raster_intersection"] = plot_path
+
+    return plot_paths
 
 
 def compute_trajectory_correlation(
@@ -425,6 +681,14 @@ def generate_comparison_report(
                 plot_key = f"{metric}_layer_{layer}"
                 plot_paths[plot_key] = plots_dir / f"{metric}_layer_{layer}_comparison.png"
 
+    # Compute Jaccard metrics (for 2-run comparison)
+    jaccard_metrics = compute_event_jaccard(runs, step_bucket=step_tolerance * 2)
+
+    # Generate event raster plots
+    raster_paths: Dict[str, Path] = {}
+    if generate_plots and plots_dir:
+        raster_paths = generate_event_raster_plot(runs, plots_dir)
+
     # Build report
     lines = []
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -436,11 +700,50 @@ def generate_comparison_report(
     lines.append(f"**Step tolerance:** {step_tolerance}")
     lines.append("")
 
+    # Detection Config Fingerprint Section (critical for apples-to-apples comparison)
+    lines.append("## Detection Config Fingerprint")
+    lines.append("")
+    lines.append("_Verify runs used identical detection parameters before interpreting results._")
+    lines.append("")
+
+    config_hashes = []
+    lines.append("| Run | Config | Hash |")
+    lines.append("|-----|--------|------|")
+    for run in runs:
+        short_id = run.run_id[:20] + "..." if len(run.run_id) > 23 else run.run_id
+        if run.detection_config:
+            fingerprint = run.detection_config.fingerprint()
+            cfg_hash = run.detection_config.config_hash()
+            config_hashes.append(cfg_hash)
+        else:
+            fingerprint = "N/A (no detection_summary)"
+            cfg_hash = "?"
+            config_hashes.append(None)
+        lines.append(f"| {short_id} | {fingerprint} | {cfg_hash} |")
+
+    lines.append("")
+
+    # Check for config mismatch
+    valid_hashes = [h for h in config_hashes if h is not None]
+    if valid_hashes and len(set(valid_hashes)) > 1:
+        lines.append("**WARNING:** Detection configs differ between runs! Results may not be comparable.")
+        lines.append("")
+    elif valid_hashes:
+        lines.append("Config match confirmed.")
+        lines.append("")
+
     # Run Summary Table
     lines.append("## Run Summary")
     lines.append("")
-    lines.append("| Run ID | Seed | Final Loss | Events | Diversity |")
-    lines.append("|--------|------|------------|--------|-----------|")
+
+    # Include retention column if any runs have it
+    has_retention = any(run.retention is not None for run in runs)
+    if has_retention:
+        lines.append("| Run ID | Seed | Final Loss | Events | Diversity | Retention |")
+        lines.append("|--------|------|------------|--------|-----------|-----------|")
+    else:
+        lines.append("| Run ID | Seed | Final Loss | Events | Diversity |")
+        lines.append("|--------|------|------------|--------|-----------|")
 
     for run in runs:
         seed = _extract_seed_from_run_id(run.run_id, run.meta)
@@ -451,7 +754,13 @@ def generate_comparison_report(
         # Truncate run_id for display
         short_id = run.run_id[:20] + "..." if len(run.run_id) > 23 else run.run_id
 
-        lines.append(f"| {short_id} | {seed} | {final_loss} | {n_events} | {diversity:.3f} |")
+        if has_retention:
+            ret_str = f"{run.retention.retention_rate:.0%}" if run.retention else "N/A"
+            lines.append(
+                f"| {short_id} | {seed} | {final_loss} | {n_events} | {diversity:.3f} | {ret_str} |"
+            )
+        else:
+            lines.append(f"| {short_id} | {seed} | {final_loss} | {n_events} | {diversity:.3f} |")
 
     lines.append("")
 
@@ -477,6 +786,55 @@ def generate_comparison_report(
             )
 
     lines.append("")
+
+    # Invariance Metrics Section (Jaccard + Precision/Recall)
+    if jaccard_metrics:
+        lines.append("## Invariance Metrics")
+        lines.append("")
+        lines.append(f"_Event keys bucketed by step (bucket={step_tolerance * 2})_")
+        lines.append("")
+        lines.append(f"- **Jaccard similarity:** {jaccard_metrics['jaccard']:.1%}")
+        lines.append(f"- **Intersection:** {jaccard_metrics['intersection']} events")
+        lines.append(f"- **Union:** {jaccard_metrics['union']} unique event keys")
+        lines.append("")
+        lines.append("| Direction | Value | Interpretation |")
+        lines.append("|-----------|-------|----------------|")
+        lines.append(
+            f"| A→B (precision) | {jaccard_metrics['precision_ab']:.1%} | "
+            f"{jaccard_metrics['intersection']}/{jaccard_metrics['events_a']} of run A's events in B |"
+        )
+        lines.append(
+            f"| B→A (recall) | {jaccard_metrics['recall_ab']:.1%} | "
+            f"{jaccard_metrics['intersection']}/{jaccard_metrics['events_b']} of run B's events in A |"
+        )
+        lines.append("")
+
+        # Interpret the metrics
+        j = jaccard_metrics['jaccard']
+        if j > 0.5:
+            lines.append("**Strong invariance** - majority of events appear in both runs.")
+        elif j > 0.25:
+            lines.append("**Moderate invariance** - significant overlap but notable differences.")
+        else:
+            lines.append("**Weak invariance** - runs have substantially different event patterns.")
+        lines.append("")
+
+    # Event Raster Plots Section
+    if raster_paths:
+        lines.append("## Event Raster Plots")
+        lines.append("")
+        lines.append("Visual comparison of event locations (x=step, y=layer, color=metric).")
+        lines.append("")
+        for name, path in raster_paths.items():
+            if output_path:
+                try:
+                    rel_path = path.relative_to(Path(output_path).parent)
+                except ValueError:
+                    rel_path = path
+            else:
+                rel_path = path
+            lines.append(f"![{name}]({rel_path})")
+            lines.append("")
 
     # Trajectory Correlation Section
     lines.append("## Trajectory Correlation (effective_rank)")
@@ -558,6 +916,85 @@ def generate_comparison_report(
 
     lines.append("")
 
+    # Detection Retention Section (if detection summaries available)
+    runs_with_retention = [r for r in runs if r.retention is not None]
+    if runs_with_retention:
+        lines.append("## Detection Retention Comparison")
+        lines.append("")
+        lines.append("Compares how many raw candidates (above threshold) survived peak selection.")
+        lines.append("")
+        lines.append("| Run | Candidates | Selected | Retention | Pre Ret. | Post Ret. | Supp | Pre-Cap |")
+        lines.append("|-----|------------|----------|-----------|----------|-----------|------|---------|")
+
+        for run in runs:
+            if run.retention:
+                r = run.retention
+                short_id = run.run_id[:15] + "..." if len(run.run_id) > 18 else run.run_id
+                lines.append(
+                    f"| {short_id} | {r.n_candidates} | {r.n_selected} | "
+                    f"{r.retention_rate:.0%} | {r.pre_retention_rate:.0%} | "
+                    f"{r.post_retention_rate:.0%} | {r.suppression_pre + r.suppression_post} | "
+                    f"{r.pre_warmup_cap} |"
+                )
+
+        lines.append("")
+
+        # Compute retention consistency
+        ret_rates = [r.retention.retention_rate for r in runs_with_retention]
+        pre_rates = [r.retention.pre_retention_rate for r in runs_with_retention]
+        post_rates = [r.retention.post_retention_rate for r in runs_with_retention]
+
+        lines.append(f"**Mean retention:** {np.mean(ret_rates):.1%} (std: {np.std(ret_rates):.1%})")
+        lines.append(f"**Mean pre-warmup retention:** {np.mean(pre_rates):.1%}")
+        lines.append(f"**Mean post-warmup retention:** {np.mean(post_rates):.1%}")
+        lines.append("")
+
+        # Density diagnostics table
+        lines.append("### Candidate Density Diagnostics")
+        lines.append("")
+        lines.append("_Higher density → more suppression; helps explain retention differences._")
+        lines.append("")
+        lines.append("| Run | Cand/Series | Post Cand/Series | Suppression | Post Ret. |")
+        lines.append("|-----|-------------|------------------|-------------|-----------|")
+
+        for run in runs_with_retention:
+            r = run.retention
+            short_id = run.run_id.split("_")[-1] if "_" in run.run_id else run.run_id[:8]
+            lines.append(
+                f"| {short_id} | {r.mean_candidates_per_series:.1f} | "
+                f"{r.mean_candidates_post_per_series:.1f} | "
+                f"{r.suppression_pre + r.suppression_post} | {r.post_retention_rate:.0%} |"
+            )
+
+        lines.append("")
+
+        # Interpret retention mismatch
+        if len(runs_with_retention) == 2:
+            r1, r2 = runs_with_retention[0].retention, runs_with_retention[1].retention
+            density_ratio = r1.mean_candidates_post_per_series / max(r2.mean_candidates_post_per_series, 0.1)
+
+            if abs(density_ratio - 1.0) > 0.3:
+                lines.append("**Density interpretation:**")
+                if density_ratio > 1.0:
+                    lines.append(
+                        f"- Run A has {density_ratio:.1f}x more post-warmup candidates per series"
+                    )
+                    lines.append("- Higher density leads to more suppression (same phenomenon, different intensity)")
+                else:
+                    lines.append(
+                        f"- Run B has {1/density_ratio:.1f}x more post-warmup candidates per series"
+                    )
+                    lines.append("- Higher density leads to more suppression (same phenomenon, different intensity)")
+                lines.append("")
+
+        # Check for consistent warmup behavior
+        if all(pr < 0.5 for pr in pre_rates) and all(por > 0.4 for por in post_rates):
+            lines.append("Warmup gate consistently filters early transients across runs.")
+        elif np.std(ret_rates) > 0.1:
+            lines.append("Note: Retention rates vary significantly across runs - check density table above.")
+
+        lines.append("")
+
     # Phase Analysis Section
     lines.append("## Event Phase Analysis")
     lines.append("")
@@ -618,11 +1055,18 @@ def generate_comparison_report(
     n_common = len(common_events)
     mean_corr_val = np.nanmean(corr_matrix.values[~np.eye(len(corr_matrix), dtype=bool)])
 
+    # Common events
     if n_common > 0:
         lines.append(f"- **{n_common} common events** detected across all seeds")
     else:
         lines.append("- **No common events** - seed invariance not established")
 
+    # Jaccard (if available)
+    if jaccard_metrics:
+        j = jaccard_metrics['jaccard']
+        lines.append(f"- **Jaccard similarity:** {j:.1%} ({jaccard_metrics['intersection']}/{jaccard_metrics['union']} events)")
+
+    # Trajectory correlation
     if not np.isnan(mean_corr_val):
         if mean_corr_val > 0.95:
             lines.append(f"- **High trajectory correlation** (mean: {mean_corr_val:.2f})")
@@ -634,11 +1078,30 @@ def generate_comparison_report(
     if std_div < 0.1:
         lines.append(f"- **Consistent diversity scores** (std: {std_div:.2f})")
 
+    # Final loss divergence warning
+    final_losses = []
+    for run in runs:
+        loss_str = _get_final_loss(run.scalars_df)
+        try:
+            final_losses.append(float(loss_str))
+        except ValueError:
+            pass
+
+    if len(final_losses) >= 2:
+        loss_diff_pct = abs(final_losses[0] - final_losses[1]) / max(min(final_losses), 0.001) * 100
+        if loss_diff_pct > 5:
+            lines.append(f"- **Warning:** Final loss differs by {loss_diff_pct:.1f}% - different learning trajectories possible")
+
     lines.append("")
 
-    if n_common > 5 and mean_corr_val > 0.9:
+    # Overall assessment
+    has_jaccard = jaccard_metrics and jaccard_metrics['jaccard'] > 0.25
+    has_common = n_common > 5
+    has_corr = not np.isnan(mean_corr_val) and mean_corr_val > 0.8
+
+    if has_jaccard and has_common and has_corr:
         lines.append("The runs show **strong seed invariance**.")
-    elif n_common > 0 or mean_corr_val > 0.8:
+    elif has_common or has_corr or has_jaccard:
         lines.append("The runs show **moderate seed invariance**.")
     else:
         lines.append("The runs show **weak seed invariance** - investigate differences.")
