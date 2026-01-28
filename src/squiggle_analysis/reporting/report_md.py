@@ -241,7 +241,7 @@ def write_report(
 
         events_summary_lines.append("")
         events_summary_lines.append(
-            "_Detection: adaptive threshold (median + 2.5×MAD), top-5 peaks per series, suppression radius=3_"
+            "_Detection: adaptive threshold (median + 2.5×MAD), top-5 peaks per series, suppression radius=15 steps_"
         )
         events_summary_lines.append("")
 

@@ -28,7 +28,8 @@ def run_analysis(
         baseline_run_id: Use another run's geometry as scoring baseline
         baseline_id: Load a persisted baseline file by ID
         event_detection_overrides: Optional dict of parameter overrides for detect_events()
-            Supported keys: peak_suppression_radius, max_events_per_series, warmup_fraction
+            Supported keys: peak_suppression_radius, max_events_per_series, warmup_fraction,
+            max_pre_warmup
     """
 
     captures_dir = paths.captures_dir(run_id)

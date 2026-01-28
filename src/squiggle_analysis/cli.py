@@ -36,7 +36,7 @@ def main():
     parser.add_argument(
         "--suppression-radius",
         type=int,
-        help="Minimum index separation between peaks (default: 3)",
+        help="Minimum step separation between peaks (default: 15, ≈3 capture intervals)",
     )
     parser.add_argument(
         "--max-events-per-series",
@@ -47,6 +47,11 @@ def main():
         "--warmup-fraction",
         type=float,
         help="Fraction of training to treat as warmup (default: 0.1)",
+    )
+    parser.add_argument(
+        "--max-pre-warmup",
+        type=int,
+        help="Max early (pre-warmup) peaks allowed per series (default: 1, use 0 to block all)",
     )
 
     # Multi-run comparison options
@@ -109,6 +114,8 @@ def main():
             event_detection_overrides["max_events_per_series"] = args.max_events_per_series
         if args.warmup_fraction is not None:
             event_detection_overrides["warmup_fraction"] = args.warmup_fraction
+        if args.max_pre_warmup is not None:
+            event_detection_overrides["max_pre_warmup"] = args.max_pre_warmup
 
         run_analysis(
             run_id=args.run_id,
