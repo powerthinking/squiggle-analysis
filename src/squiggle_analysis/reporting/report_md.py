@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-
 from squiggle_core import paths
+
+from .event_diagnostics import generate_event_diagnostics
 
 
 def _read_json(path: Path) -> dict:
@@ -133,15 +134,12 @@ def write_report(
             tmp = scalars_long.copy()
             if "wall_time" in tmp.columns:
                 tmp = tmp.drop(columns=["wall_time"])
-            wide = (
-                tmp.pivot_table(
-                    index=["run_id", "step"],
-                    columns="metric_name",
-                    values="value",
-                    aggfunc="last",
-                )
-                .reset_index()
-            )
+            wide = tmp.pivot_table(
+                index=["run_id", "step"],
+                columns="metric_name",
+                values="value",
+                aggfunc="last",
+            ).reset_index()
             wide.columns = [str(c) for c in wide.columns]
             if "step" in wide.columns:
                 wide = wide.sort_values("step").reset_index(drop=True)
@@ -161,7 +159,9 @@ def write_report(
     else:
         last = scalars.iloc[-1]
         best_loss = float(scalars["loss"].min()) if "loss" in scalars.columns else float("nan")
-        best_step = int(scalars.loc[scalars["loss"].idxmin(), "step"]) if "loss" in scalars.columns else -1
+        best_step = (
+            int(scalars.loc[scalars["loss"].idxmin(), "step"]) if "loss" in scalars.columns else -1
+        )
 
         if "step" in scalars.columns:
             scalar_lines.append(f"- steps: **{int(last['step']) + 1:,}**")
@@ -174,7 +174,9 @@ def write_report(
             scalar_lines.append(f"- grad_norm (final): **{float(last['grad_norm']):.6g}**")
 
     # ---- Probe summary ----
-    probe_lines = _probe_summary_lines(scalars) if scalars is not None else ["_No probe metrics available._"]
+    probe_lines = (
+        _probe_summary_lines(scalars) if scalars is not None else ["_No probe metrics available._"]
+    )
 
     # ---- Capture inventory ----
     cap_counts = _count_captures_by_source(captures_dir)
@@ -195,7 +197,9 @@ def write_report(
         geom_lines.append(f"- rows: **{len(geom):,}**")
         if "metric" in geom.columns:
             uniq = sorted(set(geom["metric"].astype(str).tolist()))
-            geom_lines.append(f"- metrics: `{', '.join(uniq[:20])}`" + (" …" if len(uniq) > 20 else ""))
+            geom_lines.append(
+                f"- metrics: `{', '.join(uniq[:20])}`" + (" …" if len(uniq) > 20 else "")
+            )
 
     # ---- Events table (interval-aware) ----
     events_section = ""
@@ -204,12 +208,26 @@ def write_report(
         events_section = "_No events detected (or events file missing)._"
     else:
         # Compute summary statistics
-        single_events = events[events["event_type"] == "change_point"] if "event_type" in events.columns else events
-        composite_events = events[events["event_type"] == "change_point_composite"] if "event_type" in events.columns else pd.DataFrame()
+        single_events = (
+            events[events["event_type"] == "change_point"]
+            if "event_type" in events.columns
+            else events
+        )
+        composite_events = (
+            events[events["event_type"] == "change_point_composite"]
+            if "event_type" in events.columns
+            else pd.DataFrame()
+        )
 
-        events_summary_lines.append(f"- total events: **{len(events)}** ({len(single_events)} single-metric, {len(composite_events)} composite)")
+        events_summary_lines.append(
+            f"- total events: **{len(events)}** ({len(single_events)} single-metric, {len(composite_events)} composite)"
+        )
 
-        if not single_events.empty and "layer" in single_events.columns and "metric" in single_events.columns:
+        if (
+            not single_events.empty
+            and "layer" in single_events.columns
+            and "metric" in single_events.columns
+        ):
             events_per_series = single_events.groupby(["layer", "metric"]).size()
             events_summary_lines.append(
                 f"- events per (layer, metric): min={events_per_series.min()}, max={events_per_series.max()}, mean={events_per_series.mean():.1f}"
@@ -217,10 +235,14 @@ def write_report(
 
         if "start_step" in events.columns:
             zero_start = (events["start_step"] == 0).sum()
-            events_summary_lines.append(f"- events with start_step=0: {zero_start}/{len(events)} ({100*zero_start/len(events):.1f}%)")
+            events_summary_lines.append(
+                f"- events with start_step=0: {zero_start}/{len(events)} ({100 * zero_start / len(events):.1f}%)"
+            )
 
         events_summary_lines.append("")
-        events_summary_lines.append("_Detection: adaptive threshold (median + 2.5×MAD), top-5 peaks per series, suppression radius=3_")
+        events_summary_lines.append(
+            "_Detection: adaptive threshold (median + 2.5×MAD), top-5 peaks per series, suppression radius=3_"
+        )
         events_summary_lines.append("")
 
         # Choose the most informative columns available.
@@ -230,7 +252,7 @@ def write_report(
             "event_type",
             "layer",
             "metric",
-            "step",        # canonical event timestamp (always present  in new schema)
+            "step",  # canonical event timestamp (always present  in new schema)
             "start_step",  # interval context (if present)
             "end_step",
             "score",
@@ -242,8 +264,12 @@ def write_report(
         # Stable, sensible ordering for readability
         if "score" in show.columns:
             show = show.sort_values(
-                by=["score", "layer", "metric", "step"] if "step" in show.columns else ["score", "layer", "metric"],
-                ascending=[False, True, True, True] if "step" in show.columns else [False, True, True],
+                by=["score", "layer", "metric", "step"]
+                if "step" in show.columns
+                else ["score", "layer", "metric"],
+                ascending=[False, True, True, True]
+                if "step" in show.columns
+                else [False, True, True],
             )
         else:
             # fallback ordering if score is missing for some reason
@@ -276,11 +302,11 @@ def write_report(
         if isinstance(model, dict):
             lines.append(
                 "- model: "
-                f"d_model={model.get('d_model','?')}, "
-                f"n_layers={model.get('n_layers','?')}, "
-                f"n_heads={model.get('n_heads','?')}, "
-                f"d_ff={model.get('d_ff','?')}, "
-                f"dropout={model.get('dropout','?')}"
+                f"d_model={model.get('d_model', '?')}, "
+                f"n_layers={model.get('n_layers', '?')}, "
+                f"n_heads={model.get('n_heads', '?')}, "
+                f"d_ff={model.get('d_ff', '?')}, "
+                f"dropout={model.get('dropout', '?')}"
             )
 
         lines.append("")
@@ -313,6 +339,10 @@ def write_report(
     lines.append("")
     lines.append(f"- events_candidates: `{events_candidates_path}`")
 
+    # Add event distribution diagnostics (Part 2)
+    diagnostics_section = generate_event_diagnostics(events, geom, run_id, save_artifacts=True)
+    lines.append(diagnostics_section)
+
     lines.append("")
     lines.append("## Artifacts")
     lines.append(f"- scalars (wide): `{scalars_wide_path}`")
@@ -324,4 +354,3 @@ def write_report(
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines))
     return report_path
-

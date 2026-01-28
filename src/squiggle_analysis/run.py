@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import pandas as pd
-
 from squiggle_core import paths
 from squiggle_core.schemas import parquet_schemas
 
-from .geometry.compute_state import compute_geometry_state
 from .events.change_point import detect_events
+from .geometry.compute_state import compute_geometry_state
 from .reporting.report_md import write_report
 
 
@@ -17,6 +16,7 @@ def run_analysis(
     analysis_id: str = "analysis@2.0",
     baseline_run_id: str | None = None,
     baseline_id: str | None = None,
+    event_detection_overrides: dict | None = None,
 ):
     """
     End-to-end analysis for a single run.
@@ -27,6 +27,8 @@ def run_analysis(
         analysis_id: Version identifier for this analysis
         baseline_run_id: Use another run's geometry as scoring baseline
         baseline_id: Load a persisted baseline file by ID
+        event_detection_overrides: Optional dict of parameter overrides for detect_events()
+            Supported keys: peak_suppression_radius, max_events_per_series, warmup_fraction
     """
 
     captures_dir = paths.captures_dir(run_id)
@@ -53,14 +55,19 @@ def run_analysis(
 
     # 2) Events (with optional cross-run baseline)
     if force or not events_candidates_path.exists():
-        detect_events(
-            run_id,
-            analysis_id=analysis_id,
-            baseline_run_id=baseline_run_id,
-            baseline_id=baseline_id,
-            rank_threshold=0.2,
-            mass_threshold=0.03,
-        )
+        # Build event detection kwargs with optional overrides
+        detect_kwargs = {
+            "analysis_id": analysis_id,
+            "baseline_run_id": baseline_run_id,
+            "baseline_id": baseline_id,
+            "rank_threshold": 0.2,
+            "mass_threshold": 0.03,
+        }
+        # Apply CLI overrides if provided
+        if event_detection_overrides:
+            detect_kwargs.update(event_detection_overrides)
+
+        detect_events(run_id, **detect_kwargs)
     if not events_candidates_path.exists():
         raise RuntimeError(f"detect_events did not write: {events_candidates_path}")
 

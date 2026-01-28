@@ -340,6 +340,150 @@ def _select_top_k_peaks(
     return sorted(selected)
 
 
+def _select_top_k_peaks_with_warmup(
+    hit_idxs: list[int],
+    deltas: list[float],
+    steps: list[int],
+    max_peaks: int,
+    suppression_radius: int,
+    warmup_end_step: int,
+    reserved_post_warmup: int = 2,
+) -> list[int]:
+    """Select top-K peaks with warmup-aware reservation.
+
+    Incremental suppression strategy:
+    1. FIRST: Select top 'reserved' peaks from post-warmup region only
+       - Apply suppression radius within this selection
+       - These peaks establish "protected zones"
+    2. THEN: Select remaining (max_peaks - len(reserved)) from ALL hits
+       - Apply suppression radius against BOTH reserved and new selections
+       - Early peaks can't suppress the already-selected post-warmup peaks
+    3. Return combined set, sorted by position
+
+    Args:
+        hit_idxs: Indices where deltas exceed threshold
+        deltas: All delta values
+        steps: Step values corresponding to delta indices
+        max_peaks: Maximum number of peaks to return
+        suppression_radius: Minimum index separation between peaks
+        warmup_end_step: Step at which warmup ends
+        reserved_post_warmup: Minimum peaks reserved from post-warmup
+
+    Returns:
+        List of selected peak indices, sorted by position
+    """
+    if not hit_idxs:
+        return []
+
+    # Separate hits into warmup and post-warmup
+    post_warmup_hits = [i for i in hit_idxs if steps[min(i + 1, len(steps) - 1)] > warmup_end_step]
+    all_hits = hit_idxs
+
+    # Sort by delta magnitude (descending)
+    sorted_post_warmup = sorted(post_warmup_hits, key=lambda i: deltas[i], reverse=True)
+    sorted_all = sorted(all_hits, key=lambda i: deltas[i], reverse=True)
+
+    selected: list[int] = []
+
+    # Step 1: Select reserved post-warmup peaks first
+    for idx in sorted_post_warmup:
+        if len(selected) >= reserved_post_warmup:
+            break
+        too_close = any(abs(idx - s) < suppression_radius for s in selected)
+        if not too_close:
+            selected.append(idx)
+
+    # Step 2: Fill remaining slots from all hits
+    remaining = max_peaks - len(selected)
+    for idx in sorted_all:
+        if remaining <= 0:
+            break
+        # Skip if already selected
+        if idx in selected:
+            continue
+        # Check suppression against ALL already selected peaks
+        too_close = any(abs(idx - s) < suppression_radius for s in selected)
+        if not too_close:
+            selected.append(idx)
+            remaining -= 1
+
+    # Return sorted by position (chronological order)
+    return sorted(selected)
+
+
+def _get_warmup_end_step(run_id: str, fallback_fraction: float, max_step: int) -> int:
+    """Get warmup end step from meta.json or use fallback fraction.
+
+    Args:
+        run_id: The run to check
+        fallback_fraction: Fraction of training to use as fallback (default 0.1)
+        max_step: Maximum step in the geometry data
+
+    Returns:
+        Step at which warmup ends
+    """
+    import json
+
+    meta_path = paths.run_dir(run_id) / "meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            # Check scheduler config for warmup_steps
+            scheduler = meta.get("scheduler", {})
+            if isinstance(scheduler, dict):
+                warmup_steps = scheduler.get("warmup_steps")
+                if warmup_steps is not None:
+                    return int(warmup_steps)
+            # Check optimizer config
+            optimizer = meta.get("optimizer", {})
+            if isinstance(optimizer, dict):
+                warmup_steps = optimizer.get("warmup_steps")
+                if warmup_steps is not None:
+                    return int(warmup_steps)
+        except Exception:
+            pass
+
+    # Fallback: use fraction of total training
+    return int(max_step * fallback_fraction)
+
+
+def _compute_window_delta(
+    values: list[float],
+    peak_idx: int,
+    event_window_radius: int,
+) -> tuple[float, int]:
+    """Compute signed delta from pre/post window aggregates.
+
+    Args:
+        values: Raw metric values (not deltas)
+        peak_idx: Index of the peak (delta at peak_idx is values[peak_idx+1] - values[peak_idx])
+        event_window_radius: Window size for aggregation
+
+    Returns:
+        (delta, polarity) where delta = post_mean - pre_mean and polarity = +1/-1
+    """
+    n = len(values)
+
+    # Pre-window: values before the change point
+    pre_start = max(0, peak_idx - event_window_radius + 1)
+    pre_end = peak_idx + 1  # Include value at peak_idx
+    pre_window = values[pre_start:pre_end]
+
+    # Post-window: values after the change point
+    post_start = peak_idx + 1
+    post_end = min(n, peak_idx + 1 + event_window_radius)
+    post_window = values[post_start:post_end]
+
+    # Compute means
+    pre_mean = sum(pre_window) / len(pre_window) if pre_window else values[peak_idx]
+    post_mean = sum(post_window) / len(post_window) if post_window else values[min(peak_idx + 1, n - 1)]
+
+    delta = post_mean - pre_mean
+    polarity = 1 if delta >= 0 else -1
+
+    return delta, polarity
+
+
 def detect_events(
     run_id: str,
     *,
@@ -363,10 +507,14 @@ def detect_events(
     local_baseline_fraction: float | None = 0.15,  # Alternative: ±15% of total steps
     composite_stabilization_steps: int = 10,  # Delay composite detection until this many steps
     min_event_separation: int = 5,  # Minimum steps between events of same type
-    # Peak selection parameters (new)
+    # Peak selection parameters
     max_events_per_series: int = 5,  # Target 2-5 events per (layer, metric)
     peak_suppression_radius: int = 3,  # Minimum index separation between peaks
     event_window_radius: int = 1,  # Window around each peak for start_step/end_step
+    # Warmup handling parameters (Part 3)
+    warmup_fraction: float = 0.1,  # Fallback fraction if meta.json has no schedule
+    reserved_post_warmup: int = 2,  # Minimum peaks reserved from post-warmup
+    use_warmup_handling: bool = True,  # Enable warmup-aware peak selection
 ) -> Optional[EventEntropyMetrics]:
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
@@ -430,13 +578,20 @@ def detect_events(
         "baseline_median",
         "baseline_mad",
 
-        # New: local vs global baseline fields
+        # New fields for direction-aware matching (Part 1)
+        "polarity",  # +1 (increase) or -1 (decrease)
+        "delta",  # Signed magnitude (post_mean - pre_mean)
+        "normalized_score",  # Per-series percentile rank [0,1]
+        "event_rank_in_series",  # 1-indexed rank within (layer, metric) by score
+        "series_id",  # Canonical identifier: {run_id}:{layer}:{metric}
+
+        # Local vs global baseline fields
         "local_baseline_median",
         "local_baseline_mad",
         "local_z_score",
         "baseline_scope",  # "local" or "global"
 
-        # New: event phase classification
+        # Event phase classification
         "event_phase",  # "shaping" (early), "locking" (late), or "transition"
         "phase_progress",  # 0.0-1.0 indicating position in training
 
@@ -459,7 +614,14 @@ def detect_events(
         return None
 
     # Compute total steps for local baseline window calculation
-    total_steps = int(geom["step"].max() - geom["step"].min()) if len(geom) > 1 else 1
+    step_min = int(geom["step"].min())
+    step_max = int(geom["step"].max())
+    total_steps = step_max - step_min if len(geom) > 1 else 1
+
+    # Compute warmup end step for warmup-aware peak selection (Part 3)
+    warmup_end_step = 0
+    if use_warmup_handling:
+        warmup_end_step = _get_warmup_end_step(run_id, warmup_fraction, step_max)
 
     # Determine local baseline window size
     if local_baseline_fraction is not None:
@@ -555,22 +717,42 @@ def detect_events(
         ld = layer_data.setdefault(int(layer), {})
         ld[metric_key] = {
             "steps": steps,
+            "values": values,  # Store raw values for delta computation
             "deltas_abs": deltas_abs,
             "windows": merged_windows,  # Keep merged for composite detection
         }
 
-        # Select top-K peaks with suppression (target 2-5 events per series)
-        selected_peaks = _select_top_k_peaks(
-            hit_idxs=hit_idxs,
-            deltas=deltas_abs,
-            max_peaks=max_events_per_series,
-            suppression_radius=peak_suppression_radius,
-        )
+        # Select top-K peaks with warmup-aware suppression (Part 3)
+        if use_warmup_handling and warmup_end_step > step_min:
+            selected_peaks = _select_top_k_peaks_with_warmup(
+                hit_idxs=hit_idxs,
+                deltas=deltas_abs,
+                steps=[int(s) for s in steps],
+                max_peaks=max_events_per_series,
+                suppression_radius=peak_suppression_radius,
+                warmup_end_step=warmup_end_step,
+                reserved_post_warmup=reserved_post_warmup,
+            )
+        else:
+            # Fallback to regular peak selection
+            selected_peaks = _select_top_k_peaks(
+                hit_idxs=hit_idxs,
+                deltas=deltas_abs,
+                max_peaks=max_events_per_series,
+                suppression_radius=peak_suppression_radius,
+            )
+
+        # series_id for matching (Part 1)
+        series_id = f"{run_id}:{layer}:{metric_key}"
 
         # Create events for each selected peak with local window
         for peak_idx in selected_peaks:
             # The delta at peak_idx is between steps[peak_idx] and steps[peak_idx+1]
             metric_size = float(deltas_abs[peak_idx])
+
+            # Compute signed delta and polarity from pre/post window aggregates (Part 1)
+            values_list = [float(v) for v in values]
+            delta, polarity = _compute_window_delta(values_list, peak_idx, event_window_radius)
 
             # Context window for volatility calculation
             ctx_start = max(0, peak_idx - int(window_radius_steps))
@@ -584,13 +766,12 @@ def detect_events(
             # end_step = window end for context
             win_end_idx = min(len(steps) - 1, peak_idx + 1 + event_window_radius)
 
-            start_step = int(steps[peak_idx])  # Step before the change
-            step = int(steps[min(peak_idx + 1, len(steps) - 1)])  # Step after the change
-            end_step = int(steps[win_end_idx])  # Context window end
+            ev_start_step = int(steps[peak_idx])  # Step before the change
+            ev_step = int(steps[min(peak_idx + 1, len(steps) - 1)])  # Step after the change
+            ev_end_step = int(steps[win_end_idx])  # Context window end
 
             # Compute phase progress and classification
-            step_min = int(geom["step"].min())
-            phase_progress = float((step - step_min) / max(1, total_steps))
+            phase_progress = float((ev_step - step_min) / max(1, total_steps))
             if phase_progress < shaping_boundary:
                 event_phase = "shaping"
             elif phase_progress > locking_boundary:
@@ -644,9 +825,9 @@ def detect_events(
                     "event_id": f"e{event_id}",
                     "layer": int(layer),
                     "metric": metric_key,
-                    "step": step,
-                    "start_step": start_step,
-                    "end_step": end_step,
+                    "step": ev_step,
+                    "start_step": ev_start_step,
+                    "end_step": ev_end_step,
                     "event_type": "change_point",
                     "score": score,
                     "magnitude": (float(breakdown.magnitude) if breakdown else None),
@@ -658,6 +839,13 @@ def detect_events(
                     "metric_z": metric_z,
                     "baseline_median": baseline_med,
                     "baseline_mad": baseline_mad,
+                    # New fields for direction-aware matching (Part 1)
+                    "polarity": polarity,
+                    "delta": float(delta),
+                    "normalized_score": None,  # Computed after all events collected
+                    "event_rank_in_series": None,  # Computed after all events collected
+                    "series_id": series_id,
+                    # Local baseline fields
                     "local_baseline_median": local_med,
                     "local_baseline_mad": local_mad,
                     "local_z_score": local_z,
@@ -838,7 +1026,6 @@ def detect_events(
                 vr_map[mk] = float(ve / (vb + 1e-8))
 
             # Compute phase for composite event
-            step_min = int(geom["step"].min())
             comp_phase_progress = float((step - step_min) / max(1, total_steps))
             if comp_phase_progress < shaping_boundary:
                 comp_event_phase = "shaping"
@@ -850,6 +1037,9 @@ def detect_events(
             # Skip composite events that are too early (stabilization period)
             if step < step_min + composite_stabilization_steps:
                 continue
+
+            # Composite events get a series_id for the composite layer
+            comp_series_id = f"{run_id}:{layer}:__composite__"
 
             events.append(
                 {
@@ -874,6 +1064,13 @@ def detect_events(
                     "metric_z": None,
                     "baseline_median": None,
                     "baseline_mad": None,
+                    # New fields for matching (Part 1) - composite events don't have polarity/delta
+                    "polarity": None,
+                    "delta": None,
+                    "normalized_score": None,  # Computed after all events collected
+                    "event_rank_in_series": None,  # Computed after all events collected
+                    "series_id": comp_series_id,
+                    # Local baseline fields
                     "local_baseline_median": None,
                     "local_baseline_mad": None,
                     "local_z_score": None,
@@ -903,6 +1100,25 @@ def detect_events(
     if df.empty:
         df = pd.DataFrame(columns=out_cols)
     else:
+        # Compute event_rank_in_series and normalized_score per series (Part 1)
+        # Group by series_id (run_id:layer:metric), rank by score descending
+        if "series_id" in df.columns and "score" in df.columns:
+            # For each series, compute rank (1-indexed) and normalized score
+            for series_id in df["series_id"].dropna().unique():
+                mask = df["series_id"] == series_id
+                series_scores = df.loc[mask, "score"].values
+                n_events = len(series_scores)
+
+                if n_events > 0:
+                    # Rank by score descending (highest score = rank 1)
+                    score_ranks = pd.Series(series_scores).rank(ascending=False, method="min").astype(int)
+                    df.loc[mask, "event_rank_in_series"] = score_ranks.values
+
+                    # Normalized score: percentile rank [0,1]
+                    # (n_events - rank + 1) / n_events gives 1.0 for top, 1/n for bottom
+                    normalized = (n_events - score_ranks + 1) / n_events
+                    df.loc[mask, "normalized_score"] = normalized.values
+
         # Ensure column set/order is stable
         for c in out_cols:
             if c not in df.columns:

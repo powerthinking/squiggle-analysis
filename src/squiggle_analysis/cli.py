@@ -32,6 +32,23 @@ def main():
         help="Load a persisted baseline file by ID",
     )
 
+    # Event detection parameter overrides (Part 4)
+    parser.add_argument(
+        "--suppression-radius",
+        type=int,
+        help="Minimum index separation between peaks (default: 3)",
+    )
+    parser.add_argument(
+        "--max-events-per-series",
+        type=int,
+        help="Maximum events per (layer, metric) series (default: 5)",
+    )
+    parser.add_argument(
+        "--warmup-fraction",
+        type=float,
+        help="Fraction of training to treat as warmup (default: 0.1)",
+    )
+
     # Multi-run comparison options
     parser.add_argument(
         "--output", "-o",
@@ -84,9 +101,19 @@ def main():
             print(report)
     else:
         # Single-run analysis mode
+        # Build event detection overrides from CLI args
+        event_detection_overrides = {}
+        if args.suppression_radius is not None:
+            event_detection_overrides["peak_suppression_radius"] = args.suppression_radius
+        if args.max_events_per_series is not None:
+            event_detection_overrides["max_events_per_series"] = args.max_events_per_series
+        if args.warmup_fraction is not None:
+            event_detection_overrides["warmup_fraction"] = args.warmup_fraction
+
         run_analysis(
             run_id=args.run_id,
             force=args.force,
             baseline_run_id=args.baseline_run_id,
             baseline_id=args.baseline_id,
+            event_detection_overrides=event_detection_overrides if event_detection_overrides else None,
         )
