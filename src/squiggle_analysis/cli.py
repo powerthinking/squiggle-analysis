@@ -84,6 +84,29 @@ def main():
         help="Layers for trajectory plots (default: 0 12 23)",
     )
 
+    # LLM analysis options
+    parser.add_argument(
+        "--llm-analysis",
+        action="store_true",
+        help="Generate LLM qualitative analysis of the report",
+    )
+    parser.add_argument(
+        "--llm-backend",
+        choices=["openai", "anthropic"],
+        default="openai",
+        help="LLM backend to use (default: openai)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="gpt-4o",
+        help="Model to use for LLM analysis (default: gpt-4o)",
+    )
+    parser.add_argument(
+        "--llm-question",
+        type=str,
+        help="Specific question to ask the LLM about the report",
+    )
+
     args = parser.parse_args()
 
     if args.compare:
@@ -100,6 +123,10 @@ def main():
             generate_plots=not args.no_plots,
             plots_dir=args.plots_dir,
             layers=args.layers,
+            llm_analysis=args.llm_analysis,
+            llm_backend=args.llm_backend,
+            llm_model=args.llm_model,
+            llm_question=args.llm_question,
         )
 
         if args.output is None:
@@ -123,4 +150,8 @@ def main():
             baseline_run_id=args.baseline_run_id,
             baseline_id=args.baseline_id,
             event_detection_overrides=event_detection_overrides if event_detection_overrides else None,
+            llm_analysis=args.llm_analysis,
+            llm_backend=args.llm_backend,
+            llm_model=args.llm_model,
+            llm_question=args.llm_question,
         )

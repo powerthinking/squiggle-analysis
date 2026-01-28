@@ -17,6 +17,10 @@ def run_analysis(
     baseline_run_id: str | None = None,
     baseline_id: str | None = None,
     event_detection_overrides: dict | None = None,
+    llm_analysis: bool = False,
+    llm_backend: str = "openai",
+    llm_model: str = "gpt-4o",
+    llm_question: str | None = None,
 ):
     """
     End-to-end analysis for a single run.
@@ -30,6 +34,10 @@ def run_analysis(
         event_detection_overrides: Optional dict of parameter overrides for detect_events()
             Supported keys: peak_suppression_radius, max_events_per_series, warmup_fraction,
             max_pre_warmup
+        llm_analysis: Whether to generate LLM qualitative analysis
+        llm_backend: LLM backend ("openai" or "anthropic")
+        llm_model: Model to use for analysis
+        llm_question: Optional specific question to ask the LLM
     """
 
     captures_dir = paths.captures_dir(run_id)
@@ -83,3 +91,87 @@ def run_analysis(
 
     print(f"[✓] Analysis complete for run {run_id}")
     print(f"    Report: {report_path}")
+
+    # 4) Optional LLM analysis
+    if llm_analysis:
+        _run_llm_analysis(
+            run_id=run_id,
+            geom=geom,
+            report_path=report_path,
+            event_detection_overrides=event_detection_overrides,
+            llm_backend=llm_backend,
+            llm_model=llm_model,
+            llm_question=llm_question,
+        )
+
+
+def _run_llm_analysis(
+    run_id: str,
+    geom: pd.DataFrame,
+    report_path,
+    event_detection_overrides: dict | None,
+    llm_backend: str,
+    llm_model: str,
+    llm_question: str | None,
+) -> None:
+    """Run LLM analysis on the generated report."""
+    import json
+
+    from squiggle_analysis.llm_analysis.analyzer import (
+        AnalysisRequest,
+        analyze_report,
+        write_analysis_result,
+    )
+
+    # Load metadata
+    meta_path = paths.run_dir(run_id) / "meta.json"
+    meta = {}
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+
+    # Read the generated report
+    report_content = report_path.read_text()
+
+    # Build detection config from overrides (include all parameters)
+    overrides = event_detection_overrides or {}
+    detection_config = {
+        "warmup_fraction": overrides.get("warmup_fraction", 0.1),
+        "max_pre_warmup": overrides.get("max_pre_warmup", 1),
+        "peak_suppression_radius": overrides.get("peak_suppression_radius", 15),
+        "max_events_per_series": overrides.get("max_events_per_series", 5),
+        "adaptive_k": overrides.get("adaptive_k", 2.5),
+    }
+
+    # Build run context
+    run_context = {
+        "analysis_mode": "single_run",
+        "run_id": run_id,
+        "seed": meta.get("seed"),
+        "model_info": meta.get("model", {}),
+        "step_range": [int(geom["step"].min()), int(geom["step"].max())],
+        "detection_config": detection_config,
+    }
+
+    request = AnalysisRequest(
+        run_context=run_context,
+        primary_report=report_content,
+        compare_report=None,
+        artifacts=[],  # Could list plot paths here
+        user_question=llm_question,
+    )
+
+    print(f"[...] Running LLM analysis with {llm_model}...")
+    result = analyze_report(
+        request,
+        backend=llm_backend,
+        model=llm_model,
+    )
+
+    # Write output
+    analysis_path = report_path.parent / "llm_analysis.json"
+    write_analysis_result(result, analysis_path)
+
+    print(f"[✓] LLM analysis written to: {analysis_path}")
+
+    if result.validation_errors:
+        print(f"    WARNING: {len(result.validation_errors)} validation errors in response")

@@ -630,6 +630,10 @@ def generate_comparison_report(
     generate_plots: bool = True,
     plots_dir: Optional[Path] = None,
     layers: List[int] = [0, 12, 23],
+    llm_analysis: bool = False,
+    llm_backend: str = "openai",
+    llm_model: str = "gpt-4o",
+    llm_question: Optional[str] = None,
 ) -> str:
     """
     Generate a markdown comparison report for multiple runs.
@@ -641,6 +645,10 @@ def generate_comparison_report(
         generate_plots: Whether to generate trajectory plots
         plots_dir: Directory for plots (default: same dir as output_path or cwd)
         layers: Layers to include in trajectory plots
+        llm_analysis: Whether to generate LLM qualitative analysis
+        llm_backend: LLM backend ("openai" or "anthropic")
+        llm_model: Model to use for analysis
+        llm_question: Optional specific question to ask the LLM
 
     Returns:
         Markdown report string
@@ -1118,7 +1126,94 @@ def generate_comparison_report(
             f.write(report)
         print(f"Report written to: {output_path}")
 
+    # Optional LLM analysis
+    if llm_analysis:
+        _run_llm_comparison_analysis(
+            runs=runs,
+            report_content=report,
+            output_path=output_path,
+            plot_paths=list(plot_paths.values()) + list(raster_paths.values()),
+            llm_backend=llm_backend,
+            llm_model=llm_model,
+            llm_question=llm_question,
+        )
+
     return report
+
+
+def _run_llm_comparison_analysis(
+    runs: List[RunData],
+    report_content: str,
+    output_path: Optional[Path],
+    plot_paths: List[Path],
+    llm_backend: str,
+    llm_model: str,
+    llm_question: Optional[str],
+) -> None:
+    """Run LLM analysis on the comparison report."""
+    from squiggle_analysis.llm_analysis.analyzer import (
+        AnalysisRequest,
+        analyze_report,
+        write_analysis_result,
+    )
+
+    # Build run context with detection configs
+    # Build full detection configs for each run
+    detection_configs = []
+    for r in runs:
+        if r.detection_config:
+            detection_configs.append({
+                "adaptive_k": r.detection_config.adaptive_k,
+                "suppression_radius": r.detection_config.suppression_radius,
+                "max_peaks": r.detection_config.max_peaks,
+                "warmup_end_step": r.detection_config.warmup_end_step,
+                "max_pre_warmup": r.detection_config.max_pre_warmup,
+            })
+        else:
+            detection_configs.append(None)
+
+    run_context = {
+        "analysis_mode": "comparison",
+        "run_ids": [r.run_id for r in runs],
+        "seeds": [r.meta.get("seed") for r in runs],
+        "detection_configs": detection_configs,
+        "config_fingerprints": [
+            r.detection_config.fingerprint() if r.detection_config else "unknown"
+            for r in runs
+        ],
+        "config_hashes": [
+            r.detection_config.config_hash() if r.detection_config else "?"
+            for r in runs
+        ],
+    }
+
+    request = AnalysisRequest(
+        run_context=run_context,
+        primary_report=None,
+        compare_report=report_content,
+        artifacts=[str(p) for p in plot_paths if p.exists()],
+        user_question=llm_question,
+    )
+
+    print(f"[...] Running LLM analysis with {llm_model}...")
+    result = analyze_report(
+        request,
+        backend=llm_backend,
+        model=llm_model,
+    )
+
+    # Determine output path
+    if output_path:
+        analysis_path = output_path.with_suffix(".llm_analysis.json")
+    else:
+        analysis_path = Path("comparison.llm_analysis.json")
+
+    write_analysis_result(result, analysis_path)
+
+    print(f"[✓] LLM analysis written to: {analysis_path}")
+
+    if result.validation_errors:
+        print(f"    WARNING: {len(result.validation_errors)} validation errors in response")
 
 
 def main():

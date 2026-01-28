@@ -120,7 +120,7 @@ python -m squiggle_analysis --run-id <RUN_ID> \
 Compare multiple runs for seed invariance:
 
 ```bash
-python -m squiggle_analysis.compare_runs RUN_ID1 RUN_ID2 RUN_ID3 --output comparison.md
+python -m squiggle_analysis --compare RUN_ID1 RUN_ID2 RUN_ID3 --output comparison.md
 ```
 
 The comparison includes:
@@ -128,3 +128,50 @@ The comparison includes:
 - Trajectory correlation
 - Retention metrics comparison
 - Phase distribution analysis
+
+## LLM Qualitative Analysis
+
+Optionally send reports to an LLM (GPT-4o or Claude) for expert interpretation:
+
+```bash
+# Single-run with LLM analysis
+python -m squiggle_analysis --run-id <RUN_ID> --llm-analysis
+
+# Comparison with LLM analysis and specific question
+python -m squiggle_analysis --compare RUN1 RUN2 \
+    --output comparison.md \
+    --llm-analysis \
+    --llm-question "Are these runs seed-invariant post-warmup?"
+```
+
+### LLM Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--llm-analysis` | off | Enable LLM qualitative analysis |
+| `--llm-backend` | openai | Backend: `openai` or `anthropic` |
+| `--llm-model` | gpt-4o | Model to use |
+| `--llm-question` | (none) | Specific question to ask |
+
+### Output
+
+LLM analysis writes to a separate JSON file with structured output:
+- `runs/<run_id>/reports/llm_analysis.json` (single-run)
+- `<output>.llm_analysis.json` (comparison)
+
+The output includes headline summary, key findings, hypotheses with confidence scores, recommended actions with effort/impact ratings, and suggested improvements.
+
+### Installation
+
+Requires the `llm` optional dependency:
+
+```bash
+pip install squiggle-analysis[llm]
+```
+
+Set your API key:
+
+```bash
+export OPENAI_API_KEY=sk-...    # For OpenAI
+export ANTHROPIC_API_KEY=sk-... # For Anthropic
+```
