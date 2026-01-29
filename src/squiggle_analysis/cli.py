@@ -1,13 +1,15 @@
 import argparse
 from pathlib import Path
 
+from squiggle_core import paths
+
 from .run import run_analysis
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run squiggle analysis on training runs")
 
-    # Mutually exclusive: single-run analysis vs multi-run comparison
+    # Mutually exclusive: single-run analysis vs multi-run comparison vs list
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--run-id", help="Run ID to analyze (single-run mode)")
     group.add_argument(
@@ -16,12 +18,22 @@ def main():
         metavar="RUN_ID",
         help="Compare multiple runs for seed invariance (multi-run mode)",
     )
+    group.add_argument(
+        "--list-analyses",
+        metavar="RUN_ID",
+        help="List available analysis versions for a run",
+    )
 
     # Single-run options
     parser.add_argument(
         "--force",
         action="store_true",
         help="Recompute artifacts even if they already exist",
+    )
+    parser.add_argument(
+        "--analysis-id",
+        help="Analysis version identifier. If not provided, auto-generated from detection parameters "
+             "(e.g., 'w10_p1_r15_e5_k25'). Different analysis IDs create separate output directories.",
     )
     parser.add_argument(
         "--baseline-run-id",
@@ -67,6 +79,12 @@ def main():
         help="Step tolerance for matching events in comparison (default: 5)",
     )
     parser.add_argument(
+        "--compare-analysis-ids",
+        nargs="+",
+        help="Analysis IDs for each compared run (in same order as --compare args). "
+             "Use 'auto' to auto-select the latest analysis for a run.",
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Skip trajectory plot generation in comparison mode",
@@ -82,6 +100,13 @@ def main():
         nargs="+",
         default=[0, 12, 23],
         help="Layers for trajectory plots (default: 0 12 23)",
+    )
+
+    # Output options
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing report/analysis files instead of creating new versions",
     )
 
     # LLM analysis options
@@ -109,12 +134,44 @@ def main():
 
     args = parser.parse_args()
 
-    if args.compare:
+    if args.list_analyses:
+        # List available analysis versions for a run
+        run_id = args.list_analyses
+        analysis_ids = paths.list_analysis_ids(run_id)
+
+        if not analysis_ids:
+            # Check for legacy (non-versioned) analysis
+            legacy_path = paths.events_candidates_path(run_id, None)
+            if legacy_path.exists():
+                print(f"Analysis versions for {run_id}:")
+                print(f"  (legacy) - {legacy_path}")
+            else:
+                print(f"No analysis found for {run_id}")
+        else:
+            print(f"Analysis versions for {run_id}:")
+            for aid in analysis_ids:
+                events_path = paths.events_candidates_path(run_id, aid)
+                report_path = paths.report_md_path(run_id, aid)
+                has_report = report_path.exists()
+                print(f"  {aid}")
+                print(f"    events: {events_path}")
+                if has_report:
+                    print(f"    report: {report_path}")
+
+    elif args.compare:
         # Multi-run comparison mode
         from .compare_runs import generate_comparison_report
 
         if len(args.compare) < 2:
             parser.error("--compare requires at least 2 run IDs")
+
+        # Parse analysis_ids for comparison
+        compare_analysis_ids = None
+        if args.compare_analysis_ids:
+            compare_analysis_ids = [
+                None if aid.lower() == "auto" else aid
+                for aid in args.compare_analysis_ids
+            ]
 
         report = generate_comparison_report(
             run_ids=args.compare,
@@ -123,10 +180,12 @@ def main():
             generate_plots=not args.no_plots,
             plots_dir=args.plots_dir,
             layers=args.layers,
+            analysis_ids=compare_analysis_ids,
             llm_analysis=args.llm_analysis,
             llm_backend=args.llm_backend,
             llm_model=args.llm_model,
             llm_question=args.llm_question,
+            overwrite=args.overwrite,
         )
 
         if args.output is None:
@@ -147,6 +206,7 @@ def main():
         run_analysis(
             run_id=args.run_id,
             force=args.force,
+            analysis_id=args.analysis_id,
             baseline_run_id=args.baseline_run_id,
             baseline_id=args.baseline_id,
             event_detection_overrides=event_detection_overrides if event_detection_overrides else None,
@@ -154,4 +214,5 @@ def main():
             llm_backend=args.llm_backend,
             llm_model=args.llm_model,
             llm_question=args.llm_question,
+            overwrite=args.overwrite,
         )

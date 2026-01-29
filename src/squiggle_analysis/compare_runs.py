@@ -82,6 +82,7 @@ class RunData:
     """Container for all analysis data from a single run."""
 
     run_id: str
+    analysis_id: Optional[str]
     geometry_df: pd.DataFrame
     events_df: pd.DataFrame
     scalars_df: Optional[pd.DataFrame]
@@ -91,24 +92,44 @@ class RunData:
     detection_config: Optional[DetectionConfig] = None
 
 
-def load_run_data(run_id: str) -> RunData:
+def load_run_data(run_id: str, analysis_id: Optional[str] = None) -> RunData:
     """
     Load all relevant analysis data for a single run.
 
     Args:
         run_id: The run identifier
+        analysis_id: Optional analysis version. If provided, loads versioned events/detection_summary.
+                     If None, tries to find the latest analysis or falls back to legacy paths.
 
     Returns:
         RunData with geometry, events, scalars, metadata, and diversity metrics
     """
-    # Load geometry state
+    # Load geometry state (not versioned by analysis_id)
     geometry_path = paths.geometry_state_path(run_id)
     if not geometry_path.exists():
         raise FileNotFoundError(f"Geometry state not found for {run_id}: {geometry_path}")
     geometry_df = pd.read_parquet(geometry_path)
 
-    # Load events candidates
-    events_path = paths.events_candidates_path(run_id)
+    # Determine analysis_id to use
+    used_analysis_id = analysis_id
+    if analysis_id is None:
+        # Try to find available analysis versions
+        available = paths.list_analysis_ids(run_id)
+        if available:
+            # Use the most recent (last alphabetically, which works for w10_p1... format)
+            used_analysis_id = available[-1]
+            print(f"[load_run_data] Auto-selected analysis_id: {used_analysis_id} for {run_id}")
+
+    # Load events candidates (versioned if analysis_id provided)
+    events_path = paths.events_candidates_path(run_id, used_analysis_id)
+    if not events_path.exists() and used_analysis_id:
+        # Fallback to legacy path
+        legacy_path = paths.events_candidates_path(run_id, None)
+        if legacy_path.exists():
+            events_path = legacy_path
+            used_analysis_id = None
+            print(f"[load_run_data] Falling back to legacy events path for {run_id}")
+
     if not events_path.exists():
         raise FileNotFoundError(f"Events candidates not found for {run_id}: {events_path}")
     events_df = pd.read_parquet(events_path)
@@ -132,7 +153,10 @@ def load_run_data(run_id: str) -> RunData:
     # Load detection summary (retention metrics + detection config) if available
     retention = None
     detection_config = None
-    detection_summary_path = paths.detection_summary_path(run_id)
+    detection_summary_path = paths.detection_summary_path(run_id, used_analysis_id)
+    if not detection_summary_path.exists() and used_analysis_id:
+        # Fallback to legacy path
+        detection_summary_path = paths.detection_summary_path(run_id, None)
     if detection_summary_path.exists():
         ds = pd.read_parquet(detection_summary_path)
         n_series = len(ds)
@@ -179,6 +203,7 @@ def load_run_data(run_id: str) -> RunData:
 
     return RunData(
         run_id=run_id,
+        analysis_id=used_analysis_id,
         geometry_df=geometry_df,
         events_df=events_df,
         scalars_df=scalars_df,
@@ -623,6 +648,28 @@ def _get_final_loss(scalars_df: Optional[pd.DataFrame]) -> str:
     return "N/A"
 
 
+def _get_versioned_path(base_path: Path, overwrite: bool = False) -> Path:
+    """
+    Get the appropriate path for a file, with versioning support.
+
+    If overwrite=True or file doesn't exist, returns base_path.
+    Otherwise, returns next available version: base_v2.ext, base_v3.ext, etc.
+    """
+    if overwrite or not base_path.exists():
+        return base_path
+
+    stem = base_path.stem
+    suffix = base_path.suffix
+    parent = base_path.parent
+
+    version = 2
+    while True:
+        versioned_path = parent / f"{stem}_v{version}{suffix}"
+        if not versioned_path.exists():
+            return versioned_path
+        version += 1
+
+
 def generate_comparison_report(
     run_ids: List[str],
     output_path: Optional[Path] = None,
@@ -630,10 +677,12 @@ def generate_comparison_report(
     generate_plots: bool = True,
     plots_dir: Optional[Path] = None,
     layers: List[int] = [0, 12, 23],
+    analysis_ids: Optional[List[Optional[str]]] = None,
     llm_analysis: bool = False,
     llm_backend: str = "openai",
     llm_model: str = "gpt-4o",
     llm_question: Optional[str] = None,
+    overwrite: bool = False,
 ) -> str:
     """
     Generate a markdown comparison report for multiple runs.
@@ -645,16 +694,26 @@ def generate_comparison_report(
         generate_plots: Whether to generate trajectory plots
         plots_dir: Directory for plots (default: same dir as output_path or cwd)
         layers: Layers to include in trajectory plots
+        analysis_ids: Optional list of analysis_ids, one per run_id. If None or shorter than
+                      run_ids, missing entries auto-select the latest available analysis.
         llm_analysis: Whether to generate LLM qualitative analysis
         llm_backend: LLM backend ("openai" or "anthropic")
         llm_model: Model to use for analysis
         llm_question: Optional specific question to ask the LLM
+        overwrite: If True, overwrite existing files; otherwise create new versions
 
     Returns:
         Markdown report string
     """
-    # Load all runs
-    runs = [load_run_data(run_id) for run_id in run_ids]
+    # Normalize analysis_ids to match run_ids length
+    if analysis_ids is None:
+        analysis_ids = [None] * len(run_ids)
+    else:
+        # Pad with None if shorter
+        analysis_ids = list(analysis_ids) + [None] * (len(run_ids) - len(analysis_ids))
+
+    # Load all runs with their analysis versions
+    runs = [load_run_data(run_id, aid) for run_id, aid in zip(run_ids, analysis_ids)]
 
     # Find common events
     common_events = find_common_events(runs, step_tolerance=step_tolerance)
@@ -715,10 +774,11 @@ def generate_comparison_report(
     lines.append("")
 
     config_hashes = []
-    lines.append("| Run | Config | Hash |")
-    lines.append("|-----|--------|------|")
+    lines.append("| Run | Analysis ID | Config | Hash |")
+    lines.append("|-----|-------------|--------|------|")
     for run in runs:
         short_id = run.run_id[:20] + "..." if len(run.run_id) > 23 else run.run_id
+        aid = run.analysis_id or "(legacy)"
         if run.detection_config:
             fingerprint = run.detection_config.fingerprint()
             cfg_hash = run.detection_config.config_hash()
@@ -727,7 +787,7 @@ def generate_comparison_report(
             fingerprint = "N/A (no detection_summary)"
             cfg_hash = "?"
             config_hashes.append(None)
-        lines.append(f"| {short_id} | {fingerprint} | {cfg_hash} |")
+        lines.append(f"| {short_id} | {aid} | {fingerprint} | {cfg_hash} |")
 
     lines.append("")
 
@@ -1118,24 +1178,27 @@ def generate_comparison_report(
 
     report = "\n".join(lines)
 
-    # Write to file if requested
+    # Write to file if requested (with versioning)
+    actual_output_path: Optional[Path] = None
     if output_path:
         output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w") as f:
+        actual_output_path = _get_versioned_path(output_path, overwrite=overwrite)
+        actual_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(actual_output_path, "w") as f:
             f.write(report)
-        print(f"Report written to: {output_path}")
+        print(f"Report written to: {actual_output_path}")
 
     # Optional LLM analysis
     if llm_analysis:
         _run_llm_comparison_analysis(
             runs=runs,
             report_content=report,
-            output_path=output_path,
+            output_path=actual_output_path,
             plot_paths=list(plot_paths.values()) + list(raster_paths.values()),
             llm_backend=llm_backend,
             llm_model=llm_model,
             llm_question=llm_question,
+            overwrite=overwrite,
         )
 
     return report
@@ -1149,6 +1212,7 @@ def _run_llm_comparison_analysis(
     llm_backend: str,
     llm_model: str,
     llm_question: Optional[str],
+    overwrite: bool = False,
 ) -> None:
     """Run LLM analysis on the comparison report."""
     from squiggle_analysis.llm_analysis.analyzer import (
@@ -1202,12 +1266,13 @@ def _run_llm_comparison_analysis(
         model=llm_model,
     )
 
-    # Determine output path
+    # Determine output path (with versioning)
     if output_path:
-        analysis_path = output_path.with_suffix(".llm_analysis.json")
+        base_analysis_path = output_path.with_suffix(".llm_analysis.json")
     else:
-        analysis_path = Path("comparison.llm_analysis.json")
+        base_analysis_path = Path("comparison.llm_analysis.json")
 
+    analysis_path = _get_versioned_path(base_analysis_path, overwrite=overwrite)
     write_analysis_result(result, analysis_path)
 
     print(f"[✓] LLM analysis written to: {analysis_path}")
@@ -1239,6 +1304,12 @@ def main():
         help="Step tolerance for matching events (default: 5)",
     )
     parser.add_argument(
+        "--analysis-ids",
+        nargs="+",
+        help="Analysis IDs for each run (in same order as run_ids). "
+             "Use 'auto' to auto-select the latest analysis for a run.",
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Skip trajectory plot generation",
@@ -1262,6 +1333,14 @@ def main():
     if len(args.run_ids) < 2:
         parser.error("Need at least 2 run IDs to compare")
 
+    # Parse analysis_ids
+    analysis_ids = None
+    if args.analysis_ids:
+        analysis_ids = [
+            None if aid.lower() == "auto" else aid
+            for aid in args.analysis_ids
+        ]
+
     report = generate_comparison_report(
         args.run_ids,
         output_path=args.output,
@@ -1269,6 +1348,7 @@ def main():
         generate_plots=not args.no_plots,
         plots_dir=args.plots_dir,
         layers=args.layers,
+        analysis_ids=analysis_ids,
     )
 
     if args.output is None:

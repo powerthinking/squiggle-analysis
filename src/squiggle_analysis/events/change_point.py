@@ -486,7 +486,7 @@ def _compute_window_delta_median(
 def detect_events(
     run_id: str,
     *,
-    analysis_id: str = "analysis@2.0",
+    analysis_id: str | None = None,
     baseline_id: str | None = None,
     baseline_run_id: str | None = None,
     window_radius_steps: int = 5,
@@ -511,6 +511,29 @@ def detect_events(
     use_warmup_handling: bool = True,
     max_pre_warmup: int = 1,  # Pre-warmup budget (post budget = max_events_per_series - max_pre_warmup)
 ) -> Optional[EventEntropyMetrics]:
+    """
+    Detect change point events in geometric state trajectories.
+
+    Args:
+        run_id: The run to analyze
+        analysis_id: Optional analysis version identifier. If None, auto-generates from
+                     detection parameters (e.g., "w10_p1_r15_e5_k25"). Used for versioning
+                     output files so different parameter configurations don't overwrite each other.
+        ... (other args as before)
+
+    Returns:
+        EventEntropyMetrics summarizing the detected events, or None if no geometry found
+    """
+    # Auto-generate analysis_id from detection parameters if not provided
+    if analysis_id is None:
+        analysis_id = paths.generate_analysis_id(
+            warmup_fraction=warmup_fraction,
+            max_pre_warmup=max_pre_warmup,
+            peak_suppression_radius=peak_suppression_radius,
+            max_events_per_series=max_events_per_series,
+            adaptive_k=adaptive_k,
+        )
+        print(f"[detect_events] Auto-generated analysis_id: {analysis_id}")
     geom_path = paths.geometry_state_path(run_id)
     if not geom_path.exists():
         raise FileNotFoundError(
@@ -535,8 +558,9 @@ def detect_events(
     if "created_at_utc" not in geom.columns:
         geom["created_at_utc"] = datetime.now(timezone.utc)
 
-    out = paths.events_candidates_path(run_id)
+    out = paths.events_candidates_path(run_id, analysis_id)
     out.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[detect_events] Output path: {out}")
 
     created_at_utc = datetime.now(timezone.utc)
     schema_version = "events_candidates@2.0"
@@ -1129,7 +1153,9 @@ def detect_events(
     # Write detection summary (per-series retention stats)
     if detection_summaries:
         summary_df = pd.DataFrame(detection_summaries)
-        summary_path = paths.detection_summary_path(run_id)
+        # Add analysis_id to summary for traceability
+        summary_df["analysis_id"] = analysis_id
+        summary_path = paths.detection_summary_path(run_id, analysis_id)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_df.to_parquet(summary_path, index=False)
         print(f"[detect_events] Wrote detection summary: {len(summary_df)} series to {summary_path}")

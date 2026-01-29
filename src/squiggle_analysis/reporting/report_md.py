@@ -107,9 +107,21 @@ def write_report(
     run_id: str,
     geom: Optional[pd.DataFrame] = None,
     events: Optional[pd.DataFrame] = None,
+    output_path: Optional[Path] = None,
+    analysis_id: Optional[str] = None,
 ) -> Path:
     """
     Write a Markdown report for a run.
+
+    Args:
+        run_id: The run identifier
+        geom: Optional geometry DataFrame (loaded if not provided)
+        events: Optional events DataFrame (loaded if not provided)
+        output_path: Optional output path (defaults to standard report path)
+        analysis_id: Optional analysis version for versioned paths
+
+    Returns:
+        Path to the written report
     """
     run_dir = paths.run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -120,7 +132,7 @@ def write_report(
     captures_dir = paths.captures_dir(run_id)
 
     geometry_path = paths.geometry_state_path(run_id)
-    events_candidates_path = paths.events_candidates_path(run_id)
+    events_candidates_path = paths.events_candidates_path(run_id, analysis_id)
 
     meta = _read_json(meta_path)
     scalars_wide = _try_read_parquet(scalars_wide_path)
@@ -350,7 +362,7 @@ def write_report(
     lines.append(f"- captures_dir: `{captures_dir}`")
     lines.append("")
 
-    report_path = paths.report_md_path(run_id)
+    report_path = output_path if output_path is not None else paths.report_md_path(run_id, analysis_id)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines))
     return report_path
