@@ -163,6 +163,47 @@ def _compute_local_baseline(
 
 
 @dataclass
+class WarmupInfo:
+    """Information about warmup period for reporting."""
+
+    warmup_end_step: int
+    first_capture_after_warmup: int | None
+    step_grid: list[int]
+    # Grid index information for reproducibility
+    # warmup_end_insert_idx: bisect_left position where warmup_end_step would be inserted
+    #   This is the index of the first grid step > warmup_end_step
+    warmup_end_insert_idx: int
+    # warmup_end_left_idx: index of last grid step <= warmup_end_step (or -1 if none)
+    warmup_end_left_idx: int | None
+    # first_eligible_idx: index of first_capture_after_warmup in step_grid (if present)
+    first_eligible_idx: int | None
+    # Grid spacing summary
+    grid_spacing_min: int | None
+    grid_spacing_median: int | None
+    grid_spacing_max: int | None
+
+    def to_dict(self) -> dict:
+        return {
+            "warmup_end_step": self.warmup_end_step,
+            "first_capture_after_warmup": self.first_capture_after_warmup,
+            "step_grid_min": min(self.step_grid) if self.step_grid else None,
+            "step_grid_max": max(self.step_grid) if self.step_grid else None,
+            "step_grid_count": len(self.step_grid),
+            # Grid index info (renamed for clarity)
+            "warmup_end_insert_idx": self.warmup_end_insert_idx,
+            "warmup_end_left_idx": self.warmup_end_left_idx,
+            "first_eligible_idx": self.first_eligible_idx,
+            # Legacy names for backward compatibility
+            "grid_index_of_warmup_end": self.warmup_end_insert_idx,
+            "grid_index_first_after_warmup": self.first_eligible_idx,
+            # Grid spacing
+            "grid_spacing_min": self.grid_spacing_min,
+            "grid_spacing_median": self.grid_spacing_median,
+            "grid_spacing_max": self.grid_spacing_max,
+        }
+
+
+@dataclass
 class EventEntropyMetrics:
     """Summary metrics for event distribution (entropy-based)."""
 
@@ -183,6 +224,15 @@ class EventEntropyMetrics:
     n_shaping: int
     n_transition: int
     n_locking: int
+
+    # Warmup-excluded counts
+    n_events_post_warmup: int = 0
+    n_single_metric_post_warmup: int = 0
+    n_composite_post_warmup: int = 0
+    n_composite_filtered_near_warmup: int = 0
+
+    # Warmup info for reporting
+    warmup_info: WarmupInfo | None = None
 
 
 def _shannon_entropy(counts: list[int]) -> float:
@@ -276,6 +326,20 @@ def compute_event_entropy(events_df: pd.DataFrame, total_steps: int, n_layers: i
 
 
 @dataclass
+class CandidateInfo:
+    """Details about a single candidate peak for candidate-level analysis."""
+
+    peak_idx: int  # Index in deltas array
+    peak_step: int  # Step of the peak
+    score: float  # |delta| score
+    selected: bool  # Whether this candidate was selected
+    skip_reason: Optional[str] = None  # "suppression", "topk", "pre_warmup_cap", None
+    suppressed_by_idx: Optional[int] = None  # Index of suppressor peak (if suppressed)
+    suppressed_by_step: Optional[int] = None  # Step of suppressor
+    is_pre_warmup: bool = False  # Whether this candidate is pre-warmup
+
+
+@dataclass
 class SelectionStats:
     """Stats about why candidates were kept or skipped during peak selection."""
 
@@ -293,6 +357,12 @@ class SelectionStats:
     n_skipped_suppression_post: int = 0
     n_skipped_topk_pre: int = 0
     n_skipped_topk_post: int = 0
+    # Candidate-level details (for overlap analysis)
+    candidates: list[CandidateInfo] = None  # type: ignore
+
+    def __post_init__(self):
+        if self.candidates is None:
+            self.candidates = []
 
 
 def _select_top_k_peaks_stepwise(
@@ -350,6 +420,7 @@ def _select_top_k_peaks_with_warmup_stepwise(
     warmup_end_step: int,
     max_pre_warmup: int = 1,
     return_stats: bool = False,
+    track_candidates: bool = False,
 ) -> list[int] | tuple[list[int], SelectionStats]:
     """Select top-K peaks with SEPARATE budgets for pre/post warmup.
 
@@ -358,6 +429,10 @@ def _select_top_k_peaks_with_warmup_stepwise(
       - max_pre_warmup (for pre-warmup)
 
     This prevents early transients from stealing post-warmup capacity.
+
+    Args:
+        track_candidates: If True, populate stats.candidates with per-candidate details
+                         for candidate-level overlap analysis.
     """
 
     post_hits = [i for i in hit_idxs if steps_by_idx[i] > warmup_end_step]
@@ -368,6 +443,9 @@ def _select_top_k_peaks_with_warmup_stepwise(
         n_candidates_pre=len(pre_hits),
         n_candidates_post=len(post_hits),
     )
+
+    # Track which candidates are pre-warmup for candidate logging
+    pre_hit_set = set(pre_hits)
 
     if not hit_idxs:
         if return_stats:
@@ -381,6 +459,18 @@ def _select_top_k_peaks_with_warmup_stepwise(
     selected_pre: list[int] = []
     selected_post: list[int] = []
 
+    # For candidate tracking: map idx -> CandidateInfo
+    candidate_info: dict[int, CandidateInfo] = {}
+    if track_candidates:
+        for idx in hit_idxs:
+            candidate_info[idx] = CandidateInfo(
+                peak_idx=idx,
+                peak_step=steps_by_idx[idx],
+                score=abs(deltas_abs[idx]),
+                selected=False,
+                is_pre_warmup=(idx in pre_hit_set),
+            )
+
     # SEPARATE BUDGETS: pre and post don't compete for slots
     # - max_peaks_post = max_peaks - max_pre_warmup (post-warmup budget)
     # - max_pre_warmup = pre-warmup budget (already a parameter)
@@ -392,14 +482,28 @@ def _select_top_k_peaks_with_warmup_stepwise(
         if len(selected_post) >= max_peaks_post:
             stats.n_skipped_topk += 1
             stats.n_skipped_topk_post += 1
+            if track_candidates:
+                candidate_info[idx].skip_reason = "topk"
             continue
         step = steps_by_idx[idx]
-        if any(abs(step - steps_by_idx[s]) <= suppression_radius_steps for s in selected):
+        # Find suppressor if any
+        suppressor = None
+        for s in selected:
+            if abs(step - steps_by_idx[s]) <= suppression_radius_steps:
+                suppressor = s
+                break
+        if suppressor is not None:
             stats.n_skipped_suppression += 1
             stats.n_skipped_suppression_post += 1
+            if track_candidates:
+                candidate_info[idx].skip_reason = "suppression"
+                candidate_info[idx].suppressed_by_idx = suppressor
+                candidate_info[idx].suppressed_by_step = steps_by_idx[suppressor]
             continue
         selected.append(idx)
         selected_post.append(idx)
+        if track_candidates:
+            candidate_info[idx].selected = True
 
     # 2) Select from pre-warmup (up to max_pre_warmup, with suppression)
     # Pre-warmup has its OWN budget - doesn't compete with post
@@ -407,18 +511,35 @@ def _select_top_k_peaks_with_warmup_stepwise(
         if len(selected_pre) >= max(0, int(max_pre_warmup)):
             # Use pre_warmup_cap for pre-budget overflow (distinct from post top-k)
             stats.n_skipped_pre_warmup_cap += 1
+            if track_candidates:
+                candidate_info[idx].skip_reason = "pre_warmup_cap"
             continue
         step = steps_by_idx[idx]
-        if any(abs(step - steps_by_idx[s]) <= suppression_radius_steps for s in selected):
+        suppressor = None
+        for s in selected:
+            if abs(step - steps_by_idx[s]) <= suppression_radius_steps:
+                suppressor = s
+                break
+        if suppressor is not None:
             stats.n_skipped_suppression += 1
             stats.n_skipped_suppression_pre += 1
+            if track_candidates:
+                candidate_info[idx].skip_reason = "suppression"
+                candidate_info[idx].suppressed_by_idx = suppressor
+                candidate_info[idx].suppressed_by_step = steps_by_idx[suppressor]
             continue
         selected.append(idx)
         selected_pre.append(idx)
+        if track_candidates:
+            candidate_info[idx].selected = True
 
     stats.n_selected = len(selected)
     stats.n_selected_pre = len(selected_pre)
     stats.n_selected_post = len(selected_post)
+
+    if track_candidates:
+        # Sort candidates by step for easier analysis
+        stats.candidates = sorted(candidate_info.values(), key=lambda c: c.peak_step)
 
     result = sorted(selected, key=lambda i: steps_by_idx[i])
     if return_stats:
@@ -510,6 +631,8 @@ def detect_events(
     warmup_fraction: float = 0.1,
     use_warmup_handling: bool = True,
     max_pre_warmup: int = 1,  # Pre-warmup budget (post budget = max_events_per_series - max_pre_warmup)
+    composite_warmup_buffer_points: int = 2,  # Don't allow composites within N grid points of warmup end
+    log_candidates: bool = False,  # If True, write per-candidate details for overlap analysis
 ) -> Optional[EventEntropyMetrics]:
     """
     Detect change point events in geometric state trajectories.
@@ -609,6 +732,17 @@ def detect_events(
         "volatility_event_json",
         "volatility_baseline_json",
         "volatility_ratio_json",
+        # Composite window and strength fields
+        "composite_start_step",
+        "composite_end_step",
+        "composite_center_step",
+        "composite_strength",
+        "composite_n_metrics",
+        "composite_overlap_len",
+        "composite_window_len",
+        "composite_alignment_std",
+        "composite_coverage_ratio",
+        "composite_min_metric_occupancy",
     ]
 
     if geom.empty:
@@ -619,12 +753,22 @@ def detect_events(
     step_max = int(geom["step"].max())
     total_steps = max(1, step_max - step_min)
 
+    # Build step grid from geometry (unique steps in sorted order)
+    step_grid = sorted([int(s) for s in geom["step"].unique().tolist()])
+
     warmup_end_step = 0
+    first_capture_after_warmup: int | None = None
     if use_warmup_handling:
         warmup_end_step = _get_warmup_end_step(run_id, step_min, warmup_fraction, step_max)
+        # Find first capture step after warmup end
+        for s in step_grid:
+            if s > warmup_end_step:
+                first_capture_after_warmup = s
+                break
         print(
             f"[detect_events] warmup_end_step={warmup_end_step}, step_min={step_min}, "
-            f"step_max={step_max}, warmup_fraction={warmup_fraction}"
+            f"step_max={step_max}, warmup_fraction={warmup_fraction}, "
+            f"first_capture_after_warmup={first_capture_after_warmup}"
         )
 
     # Local baseline window precedence: explicit window wins; fraction only used if window is None.
@@ -681,6 +825,9 @@ def detect_events(
     # Collect per-series detection summary for retention analysis
     detection_summaries: list[dict] = []
 
+    # Collect per-candidate details for candidate-level overlap analysis
+    all_candidates: list[dict] = []
+
     layer_data: dict[int, dict[str, dict[str, object]]] = {}
 
     for (layer, metric), g in geom.groupby(["layer", "metric"], sort=True):
@@ -723,6 +870,7 @@ def detect_events(
                 warmup_end_step=int(warmup_end_step),
                 max_pre_warmup=int(max_pre_warmup),
                 return_stats=True,
+                track_candidates=log_candidates,
             )
         else:
             selected_peaks, select_stats = _select_top_k_peaks_stepwise(
@@ -773,6 +921,25 @@ def detect_events(
                 float(select_stats.n_skipped_topk / n_raw) if n_raw > 0 else 0.0
             ),
         })
+
+        # Collect per-candidate details if enabled
+        if log_candidates and select_stats.candidates:
+            for cand in select_stats.candidates:
+                all_candidates.append({
+                    "run_id": run_id,
+                    "analysis_id": analysis_id,
+                    "layer": int(layer),
+                    "metric": metric_key,
+                    "series_id": series_id,
+                    "peak_idx": cand.peak_idx,
+                    "peak_step": cand.peak_step,
+                    "score": cand.score,
+                    "selected": cand.selected,
+                    "skip_reason": cand.skip_reason,
+                    "suppressed_by_idx": cand.suppressed_by_idx,
+                    "suppressed_by_step": cand.suppressed_by_step,
+                    "is_pre_warmup": cand.is_pre_warmup,
+                })
 
         # Build composite windows from SELECTED peaks only (not all hits)
         selected_windows: list[tuple[int, int]] = []
@@ -909,6 +1076,9 @@ def detect_events(
         if layer_v is not None and ev.get("event_type") == "change_point":
             single_metric_events_per_layer[int(layer_v)] = single_metric_events_per_layer.get(int(layer_v), 0) + 1
 
+    # Track composites filtered near warmup end
+    composites_filtered_near_warmup = 0
+
     for layer, metrics in sorted(layer_data.items()):
         all_windows: list[tuple[int, int]] = []
         for info in metrics.values():
@@ -999,23 +1169,124 @@ def detect_events(
             if len(metric_sizes_all) < k_req:
                 continue
 
-            peak_idx = s_idx
-            max_delta = 0.0
-            for metric_key in component:
-                info = metrics.get(metric_key)
-                if info is None:
-                    continue
-                deltas_abs = info.get("deltas_abs")
-                if not isinstance(deltas_abs, list) or not deltas_abs:
-                    continue
-                for i in range(s_idx, min(e_idx + 1, len(deltas_abs))):
-                    if deltas_abs[i] > max_delta:
-                        max_delta = deltas_abs[i]
-                        peak_idx = i
+            # Compute composite strength based on window overlap
+            # 1. Compute the union of all metric windows within this composite window
+            union_segments: list[tuple[int, int]] = []
+            metric_window_lengths: list[int] = []
+            metric_peak_indices: list[int] = []  # For alignment calculation
 
-            step = int(steps_ref_list[min(peak_idx + 1, len(steps_ref_list) - 1)])
-            start_step = int(steps_ref_list[max(0, s_idx)])
-            end_step = int(steps_ref_list[min(e_idx + 1, len(steps_ref_list) - 1)])
+            for metric_key in component:
+                segs = covered.get(metric_key, [])
+                metric_total_len = 0
+                for seg in segs:
+                    union_segments.append(seg)
+                    metric_total_len += _interval_len(seg)
+                metric_window_lengths.append(metric_total_len)
+
+                # Find peak index for this metric within the composite window
+                info = metrics.get(metric_key)
+                if info is not None:
+                    deltas_abs = info.get("deltas_abs")
+                    if isinstance(deltas_abs, list) and deltas_abs:
+                        peak_idx = s_idx
+                        max_d = 0.0
+                        for i in range(s_idx, min(e_idx + 1, len(deltas_abs))):
+                            if deltas_abs[i] > max_d:
+                                max_d = deltas_abs[i]
+                                peak_idx = i
+                        metric_peak_indices.append(peak_idx)
+
+            total_metric_window_len = sum(metric_window_lengths)
+
+            # Merge union segments to get total covered
+            union_merged = _merge_overlapping_windows(union_segments)
+            union_covered_len = _covered_len(union_merged)
+
+            # Composite window length with minimum clamp to avoid tiny-window inflation
+            min_window_len = 3  # Minimum 3 grid points for meaningful strength
+            composite_window_len = max(cand_len, min_window_len)
+
+            # Compute average pairwise overlap for strength
+            pairwise_overlaps: list[int] = []
+            for i in range(len(component)):
+                for j in range(i + 1, len(component)):
+                    a = component[i]
+                    b = component[j]
+                    ol = _overlap_len(covered.get(a, []), covered.get(b, []))
+                    pairwise_overlaps.append(ol)
+
+            avg_pairwise_overlap = (
+                sum(pairwise_overlaps) / len(pairwise_overlaps)
+                if pairwise_overlaps else 0
+            )
+
+            # Compute alignment std (std dev of peak indices - lower = tighter co-occurrence)
+            alignment_std = 0.0
+            if len(metric_peak_indices) >= 2:
+                mean_peak = sum(metric_peak_indices) / len(metric_peak_indices)
+                variance = sum((p - mean_peak) ** 2 for p in metric_peak_indices) / len(metric_peak_indices)
+                alignment_std = variance ** 0.5
+
+            # Composite strength combines:
+            # 1. overlap_ratio: avg pairwise overlap / window length (how much metrics agree)
+            # 2. coverage_ratio: how much each metric occupies the union (penalizes sparse participation)
+            # 3. n_metrics_bonus: log2(n_metrics) to reward more participating metrics
+            # 4. min_metric_occupancy_penalty: penalize "tagalong" metrics that barely participate
+            n_component_metrics = len(component)
+            overlap_ratio = avg_pairwise_overlap / max(1, composite_window_len)
+
+            # Coverage ratio = sum of individual window lengths / (n_metrics * union_len)
+            # This measures how much each metric actually occupies the union
+            expected_total = n_component_metrics * max(1, union_covered_len)
+            coverage_ratio = total_metric_window_len / expected_total if expected_total > 0 else 0.0
+
+            # Min metric occupancy = min(metric_window_len / union_len) across metrics
+            # A metric that only overlaps 10% shouldn't get full credit
+            if union_covered_len > 0 and metric_window_lengths:
+                metric_occupancies = [mwl / union_covered_len for mwl in metric_window_lengths]
+                min_metric_occupancy = min(metric_occupancies)
+            else:
+                min_metric_occupancy = 0.0
+
+            n_metrics_bonus = 1.0 + (math.log2(n_component_metrics) if n_component_metrics > 1 else 0)
+
+            # Apply min occupancy penalty: weak metric = weak composite
+            # strength *= (0.5 + 0.5 * min_metric_occupancy)
+            occupancy_penalty = 0.5 + 0.5 * min_metric_occupancy
+
+            # Weight overlap higher than coverage, then apply penalties
+            composite_strength = (0.7 * overlap_ratio + 0.3 * coverage_ratio) * n_metrics_bonus * occupancy_penalty
+
+            # Use MEDIAN of covered grid indices as center (robust to asymmetric shapes)
+            # Collect all grid indices covered by any metric
+            covered_indices: list[int] = []
+            for seg in union_segments:
+                for i in range(seg[0], seg[1] + 1):
+                    covered_indices.append(i)
+
+            if covered_indices:
+                covered_indices.sort()
+                center_idx = covered_indices[len(covered_indices) // 2]  # Median
+                union_start_idx = min(covered_indices)
+                union_end_idx = max(covered_indices)
+            elif union_merged:
+                union_start_idx = min(seg[0] for seg in union_merged)
+                union_end_idx = max(seg[1] for seg in union_merged)
+                center_idx = (union_start_idx + union_end_idx) // 2
+            else:
+                union_start_idx = s_idx
+                union_end_idx = e_idx
+                center_idx = (s_idx + e_idx) // 2
+
+            # Store full composite window (start/center/end)
+            composite_center_step = int(steps_ref_list[min(center_idx, len(steps_ref_list) - 1)])
+            composite_start_step_val = int(steps_ref_list[max(0, union_start_idx)])
+            composite_end_step_val = int(steps_ref_list[min(union_end_idx, len(steps_ref_list) - 1)])
+
+            # Use center as the canonical "step" for the event
+            step = composite_center_step
+            start_step = composite_start_step_val
+            end_step = composite_end_step_val
 
             baselines_scored: dict[str, object] = {}
             metric_sizes_scored: dict[str, float] = {}
@@ -1067,6 +1338,29 @@ def detect_events(
             if step < step_min + composite_stabilization_steps:
                 continue
 
+            # Filter composite events near warmup end (within N grid points)
+            # This prevents transient warmup artifacts from appearing as composite events
+            # Uses grid INDEX distance, not step distance, for resolution-independence
+            if use_warmup_handling and composite_warmup_buffer_points > 0:
+                try:
+                    # Use center_idx (already a grid index) for the composite position
+                    # Find the grid index where warmup ends
+                    warmup_grid_idx = -1
+                    for i, s in enumerate(step_grid):
+                        if s > warmup_end_step:
+                            warmup_grid_idx = i
+                            break
+
+                    if warmup_grid_idx >= 0 and center_idx >= 0:
+                        # Grid distance = composite grid index - first post-warmup grid index
+                        grid_distance = center_idx - warmup_grid_idx
+                        if 0 <= grid_distance < composite_warmup_buffer_points:
+                            # This composite is too close to warmup end - skip it
+                            composites_filtered_near_warmup += 1
+                            continue
+                except (ValueError, IndexError):
+                    pass
+
             comp_series_id = f"{run_id}:{int(layer)}:__composite__"
 
             events.append(
@@ -1116,6 +1410,17 @@ def detect_events(
                     "volatility_event_json": json.dumps(volatility_event_all, sort_keys=True),
                     "volatility_baseline_json": json.dumps(vb_map, sort_keys=True),
                     "volatility_ratio_json": json.dumps(vr_map, sort_keys=True),
+                    # Composite window and strength fields
+                    "composite_start_step": int(composite_start_step_val),
+                    "composite_end_step": int(composite_end_step_val),
+                    "composite_center_step": int(composite_center_step),
+                    "composite_strength": float(composite_strength),
+                    "composite_n_metrics": int(n_component_metrics),
+                    "composite_overlap_len": int(avg_pairwise_overlap),
+                    "composite_window_len": int(composite_window_len),
+                    "composite_alignment_std": float(alignment_std),
+                    "composite_coverage_ratio": float(coverage_ratio),
+                    "composite_min_metric_occupancy": float(min_metric_occupancy),
                 }
             )
             event_id += 1
@@ -1160,6 +1465,95 @@ def detect_events(
         summary_df.to_parquet(summary_path, index=False)
         print(f"[detect_events] Wrote detection summary: {len(summary_df)} series to {summary_path}")
 
+    # Write candidate-level details (for candidate-level overlap analysis)
+    if all_candidates:
+        candidates_df = pd.DataFrame(all_candidates)
+        candidates_path = paths.run_dir(run_id) / "analysis" / (analysis_id or "default") / "candidates.parquet"
+        candidates_path.parent.mkdir(parents=True, exist_ok=True)
+        candidates_df.to_parquet(candidates_path, index=False)
+        print(f"[detect_events] Wrote candidates: {len(candidates_df)} candidates to {candidates_path}")
+
     n_layers = int(geom["layer"].nunique()) if "layer" in geom.columns else 1
     entropy_metrics = compute_event_entropy(df, total_steps, n_layers)
+
+    # Compute warmup-excluded counts
+    n_events_post_warmup = 0
+    n_single_metric_post_warmup = 0
+    n_composite_post_warmup = 0
+    n_composite_filtered_near_warmup = 0
+
+    if use_warmup_handling and not df.empty and "step" in df.columns:
+        post_warmup_mask = df["step"] > warmup_end_step
+        n_events_post_warmup = int(post_warmup_mask.sum())
+
+        if "event_type" in df.columns:
+            single_mask = df["event_type"] == "change_point"
+            composite_mask = df["event_type"] == "change_point_composite"
+            n_single_metric_post_warmup = int((post_warmup_mask & single_mask).sum())
+            n_composite_post_warmup = int((post_warmup_mask & composite_mask).sum())
+
+            # Use the counter from the composite creation loop
+            n_composite_filtered_near_warmup = composites_filtered_near_warmup
+
+    # Update entropy_metrics with warmup-excluded counts
+    entropy_metrics.n_events_post_warmup = n_events_post_warmup
+    entropy_metrics.n_single_metric_post_warmup = n_single_metric_post_warmup
+    entropy_metrics.n_composite_post_warmup = n_composite_post_warmup
+    entropy_metrics.n_composite_filtered_near_warmup = n_composite_filtered_near_warmup
+
+    # Create WarmupInfo for reporting with grid index information
+    # Compute warmup_end_insert_idx: bisect_left position where warmup_end_step would be inserted
+    # This is the index of the first grid step > warmup_end_step
+    warmup_end_insert_idx = 0
+    for i, s in enumerate(step_grid):
+        if s > warmup_end_step:
+            warmup_end_insert_idx = i
+            break
+    else:
+        warmup_end_insert_idx = len(step_grid)
+
+    # Compute warmup_end_left_idx: index of last grid step <= warmup_end_step (or None if none)
+    warmup_end_left_idx: int | None = None
+    if warmup_end_insert_idx > 0:
+        warmup_end_left_idx = warmup_end_insert_idx - 1
+
+    # Grid index of first capture after warmup (first eligible)
+    first_eligible_idx: int | None = None
+    if first_capture_after_warmup is not None and first_capture_after_warmup in step_grid:
+        first_eligible_idx = step_grid.index(first_capture_after_warmup)
+
+    # Compute grid spacing summary
+    grid_spacing_min: int | None = None
+    grid_spacing_median: int | None = None
+    grid_spacing_max: int | None = None
+    if len(step_grid) >= 2:
+        deltas = [step_grid[i + 1] - step_grid[i] for i in range(len(step_grid) - 1)]
+        grid_spacing_min = min(deltas)
+        grid_spacing_max = max(deltas)
+        grid_spacing_median = sorted(deltas)[len(deltas) // 2]
+
+    warmup_info = WarmupInfo(
+        warmup_end_step=warmup_end_step,
+        first_capture_after_warmup=first_capture_after_warmup,
+        step_grid=step_grid,
+        warmup_end_insert_idx=warmup_end_insert_idx,
+        warmup_end_left_idx=warmup_end_left_idx,
+        first_eligible_idx=first_eligible_idx,
+        grid_spacing_min=grid_spacing_min,
+        grid_spacing_median=grid_spacing_median,
+        grid_spacing_max=grid_spacing_max,
+    )
+    entropy_metrics.warmup_info = warmup_info
+
+    # Write warmup info to a separate file for easy access by reporting
+    # Include additional detection metadata
+    warmup_info_dict = warmup_info.to_dict()
+    warmup_info_dict["n_composites_filtered_near_warmup"] = n_composite_filtered_near_warmup
+    warmup_info_dict["composite_warmup_buffer_points"] = composite_warmup_buffer_points
+
+    warmup_info_path = paths.run_dir(run_id) / "analysis" / (analysis_id or "default") / "warmup_info.json"
+    warmup_info_path.parent.mkdir(parents=True, exist_ok=True)
+    warmup_info_path.write_text(json.dumps(warmup_info_dict, indent=2))
+    print(f"[detect_events] Wrote warmup info: {warmup_info_path}")
+
     return entropy_metrics

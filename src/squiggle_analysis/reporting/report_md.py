@@ -352,7 +352,9 @@ def write_report(
     lines.append(f"- events_candidates: `{events_candidates_path}`")
 
     # Add event distribution diagnostics (Part 2)
-    diagnostics_section = generate_event_diagnostics(events, geom, run_id, save_artifacts=True)
+    diagnostics_section = generate_event_diagnostics(
+        events, geom, run_id, save_artifacts=True, analysis_id=analysis_id
+    )
     lines.append(diagnostics_section)
 
     lines.append("")

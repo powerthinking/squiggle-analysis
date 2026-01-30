@@ -123,11 +123,50 @@ Compare multiple runs for seed invariance:
 python -m squiggle_analysis --compare RUN_ID1 RUN_ID2 RUN_ID3 --output comparison.md
 ```
 
-The comparison includes:
-- Common events across runs
-- Trajectory correlation
+### The Invariance Stack
+
+Cross-run comparison computes invariance at multiple levels:
+
+| Level | Metric | Question |
+|-------|--------|----------|
+| **Signal** | Trajectory Correlation | Do the geometry curves look the same? |
+| **Neighborhood** | Neighbor Coverage | Do both seeds show activity in the same neighborhoods? |
+| **Peak** | IoU Jaccard | Do they select the same discrete event winners? |
+
+### Key Metrics
+
+**Trajectory Correlation** — Pearson correlation of geometry time series. Values > 0.9 indicate strong signal invariance.
+
+**Neighbor Coverage** — Fraction of events with a neighbor (within suppression radius) in the other run. Answers: "Are both seeds showing activity in the same neighborhoods?" This is NOT a true Jaccard; it's a symmetric coverage score.
+
+**Peak IoU Jaccard** — Traditional event matching using window overlap. Answers: "Do they select the same discrete winners?"
+
+### Interpreting "Stable Landscape / Unstable Argmax"
+
+The most common pattern:
+- High trajectory correlation (~0.91)
+- Moderate neighbor coverage (~50%)
+- Low peak IoU Jaccard (~29%)
+
+This means: *Both seeds detect events in the same neighborhoods, but pick different winners due to suppression sensitivity.* The underlying signal is reproducible; only the final peak selection is noise-sensitive.
+
+### Additional Outputs
+
+- Common events across runs (strict ±5 step matching)
+- Nearest-neighbor distance statistics (median, p90, p95)
+- Winner stability (fraction where peak winners align)
 - Retention metrics comparison
 - Phase distribution analysis
+
+### Interactive Notebook
+
+For detailed visualization and LLM-assisted analysis, use:
+
+```
+squiggle-experiments/notebooks/compare_runs_interactive.ipynb
+```
+
+See `squiggle-matching/docs/cross_seed_analysis.md` for comprehensive documentation.
 
 ## LLM Qualitative Analysis
 
